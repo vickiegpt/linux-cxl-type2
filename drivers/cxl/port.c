@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright(c) 2022 Intel Corporation. All rights reserved. */
+#include <linux/device.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+
+#include "cxlmem.h"
+#include "cxlpci.h"
+#include "private.h"
+#include "cxlcache.h"
+
+/**
+ * DOC: cxl port
+ *
+ * The port driver enumerates dport via PCI and scans for HDM
+ * (Host-managed-Device-Memory) decoder resources via the
+ * @component_reg_phys value passed in by the agent that registered the
+ * port. All descendant ports of a CXL root port (described by platform
+ * firmware) are managed in this drivers context. Each driver instance
+ * is responsible for tearing down the driver context of immediate
+ * descendant ports. The locking for this is validated by
+ * CONFIG_PROVE_CXL_LOCKING.
+ *
+ * The primary service this driver provides is presenting APIs to other
+ * drivers to utilize the decoders, and indicating to userspace (via bind
+ * status) the connectivity of the CXL.mem protocol throughout the
+ * PCIe topology.
+ */
+
+static DEFINE_MUTEX(cache_id_lock);
+
+static void schedule_detach(void *cxlmd)
+{
+	schedule_cxl_memdev_detach(cxlmd);
+}
+
+static int discover_region(struct device *dev, void *unused)
+{
+	struct cxl_endpoint_decoder *cxled;
+	int rc;
+
+	if (!is_endpoint_decoder(dev))
+		return 0;
+
+	cxled = to_cxl_endpoint_decoder(dev);
+	if ((cxled->cxld.flags & CXL_DECODER_F_ENABLE) == 0)
+		return 0;
+
+	if (cxled->state != CXL_DECODER_STATE_AUTO)
+		return 0;
+
+	/*
+	 * Region enumeration is opportunistic, if this add-event fails,
+	 * continue to the next endpoint decoder.
+	 */
+	rc = cxl_add_to_region(cxled);
+	if (rc)
+		dev_dbg(dev, "failed to add to region: %#llx-%#llx\n",
+			cxled->cxld.hpa_range.start, cxled->cxld.hpa_range.end);
+
+	return 0;
+}
+
+static int cxl_switch_port_probe(struct cxl_port *port)
+{
+	/* Reset nr_dports for rebind of driver */
+	port->nr_dports = 0;
+
+	/* Cache the data early to ensure is_visible() works */
+	read_cdat_data(port);
+
+	return 0;
+}
+
+static int cxl_mem_endpoint_port_probe(struct cxl_port *port)
+{
+	struct cxl_memdev *cxlmd = to_cxl_memdev(port->uport_dev);
+	int rc;
+
+	/* Cache the data early to ensure is_visible() works */
+	read_cdat_data(port);
+	cxl_endpoint_parse_cdat(port);
+
+	rc = devm_add_action_or_reset(&port->dev, schedule_detach, cxlmd);
+	if (rc)
+		return rc;
+
+	rc = devm_cxl_endpoint_decoders_setup(port);
+	if (rc)
+		return rc;
+
+	/*
+	 * Now that all endpoint decoders are successfully enumerated, try to
+	 * assemble regions from committed decoders
+	 */
+	device_for_each_child(&port->dev, NULL, discover_region);
+
+	return 0;
+}
+
+static bool cxl_endpoint_is_only_cachedev(struct cxl_port *endpoint)
+{
+	unsigned long index;
+	struct cxl_ep *ep;
+	int cnt;
+
+	for (struct cxl_port *port = endpoint;
+	     !is_cxl_root(parent_port_of(port)); port = parent_port_of(port)) {
+		cnt = 0;
+
+		xa_for_each(&port->endpoints, index, ep) {
+			if (is_cxl_cachedev(ep->ep))
+				cnt++;
+
+			if (cnt > 1)
+				return false;
+		}
+	}
+
+	return true;
+}
+
+static void free_cache_id(void *data)
+{
+	struct cxl_cachedev *cxlcd = data;
+	struct cxl_cache_state *cstate = &cxlcd->cxlds->cstate;
+
+	cxl_endpoint_free_cache_id(cxlcd->endpoint, cstate->cache_id);
+	cstate->cache_id = CXL_CACHE_ID_NO_ID;
+}
+
+static int cxl_cache_endpoint_port_probe(struct cxl_port *port)
+{
+	struct cxl_cachedev *cxlcd = to_cxl_cachedev(port->uport_dev);
+	int rc, orig, id;
+
+	rc = cxl_endpoint_map_cache_id_regs(port);
+	if (rc) {
+		/*
+		 * It's fine to not have cache id capabilities if this cachedev
+		 * is the only one in its VH
+		 */
+		if (cxl_endpoint_is_only_cachedev(port))
+			return 0;
+
+		return -EBUSY;
+	}
+
+	guard(mutex)(&cache_id_lock);
+	rc = cxl_endpoint_get_cache_id(port, &orig);
+	if (rc)
+		return rc;
+
+	id = cxl_endpoint_allocate_cache_id(port, orig);
+	if (id < 0)
+		return id;
+
+	cxlcd->cxlds->cstate.cache_id = id;
+	rc = devm_add_action_or_reset(&cxlcd->dev, free_cache_id, cxlcd);
+	if (rc)
+		return rc;
+
+	if (orig == CXL_CACHE_ID_NO_ID)
+		return devm_cxl_endpoint_program_cache_id(port, id);
+
+	return 0;
+}
+
+static int cxl_endpoint_port_probe(struct cxl_port *port)
+{
+	struct device *ep_dev = port->uport_dev;
+
+	get_device(ep_dev);
+	if (is_cxl_memdev(ep_dev))
+		return cxl_mem_endpoint_port_probe(port);
+	else
+		return cxl_cache_endpoint_port_probe(port);
+}
+
+static int cxl_port_probe(struct device *dev)
+{
+	struct cxl_port *port = to_cxl_port(dev);
+
+	if (is_cxl_endpoint(port))
+		return cxl_endpoint_port_probe(port);
+	return cxl_switch_port_probe(port);
+}
+
+static ssize_t CDAT_read(struct file *filp, struct kobject *kobj,
+			 const struct bin_attribute *bin_attr, char *buf,
+			 loff_t offset, size_t count)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct cxl_port *port = to_cxl_port(dev);
+
+	if (!port->cdat_available)
+		return -ENXIO;
+
+	if (!port->cdat.table)
+		return 0;
+
+	return memory_read_from_buffer(buf, count, &offset,
+				       port->cdat.table,
+				       port->cdat.length);
+}
+
+static const BIN_ATTR_ADMIN_RO(CDAT, 0);
+
+static umode_t cxl_port_bin_attr_is_visible(struct kobject *kobj,
+					    const struct bin_attribute *attr, int i)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct cxl_port *port = to_cxl_port(dev);
+
+	if ((attr == &bin_attr_CDAT) && port->cdat_available)
+		return attr->attr.mode;
+
+	return 0;
+}
+
+static const struct bin_attribute *const cxl_cdat_bin_attributes[] = {
+	&bin_attr_CDAT,
+	NULL,
+};
+
+static const struct attribute_group cxl_cdat_attribute_group = {
+	.bin_attrs = cxl_cdat_bin_attributes,
+	.is_bin_visible = cxl_port_bin_attr_is_visible,
+};
+
+static const struct attribute_group *cxl_port_attribute_groups[] = {
+	&cxl_cdat_attribute_group,
+	NULL,
+};
+
+static struct cxl_driver cxl_port_driver = {
+	.name = "cxl_port",
+	.probe = cxl_port_probe,
+	.id = CXL_DEVICE_PORT,
+	.drv = {
+		.probe_type = PROBE_FORCE_SYNCHRONOUS,
+		.dev_groups = cxl_port_attribute_groups,
+	},
+};
+
+int devm_cxl_add_endpoint(struct device *host, struct device *ep_dev,
+			  struct cxl_dport *parent_dport)
+{
+	struct cxl_port *parent_port = parent_dport->port;
+	struct cxl_port *endpoint, *iter, *down;
+	int rc;
+
+	if (!is_cxl_ep_device(ep_dev))
+		return -EINVAL;
+
+	/*
+	 * Now that the path to the root is established record all the
+	 * intervening ports in the chain.
+	 */
+	for (iter = parent_port, down = NULL; !is_cxl_root(iter);
+	     down = iter, iter = to_cxl_port(iter->dev.parent)) {
+		struct cxl_ep *ep;
+
+		ep = cxl_ep_load(iter, ep_dev);
+		ep->next = down;
+	}
+
+	/* Note: endpoint port component registers are derived from @cxlds */
+	endpoint = devm_cxl_add_port(host, ep_dev, CXL_RESOURCE_NONE,
+				     parent_dport);
+	if (IS_ERR(endpoint))
+		return PTR_ERR(endpoint);
+
+	rc = cxl_endpoint_autoremove(ep_dev, endpoint);
+	if (rc)
+		return rc;
+
+	if (!endpoint->dev.driver) {
+		dev_err(ep_dev, "%s failed probe\n",
+			dev_name(&endpoint->dev));
+		return -ENXIO;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(devm_cxl_add_endpoint, "CXL");
+
+static int __init cxl_port_init(void)
+{
+	return cxl_driver_register(&cxl_port_driver);
+}
+/*
+ * Be ready to immediately enable ports emitted by the platform CXL root
+ * (e.g. cxl_acpi) when CONFIG_CXL_PORT=y.
+ */
+subsys_initcall(cxl_port_init);
+
+static void __exit cxl_port_exit(void)
+{
+	cxl_driver_unregister(&cxl_port_driver);
+}
+module_exit(cxl_port_exit);
+
+MODULE_DESCRIPTION("CXL: Port enumeration and services");
+MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS("CXL");
+MODULE_ALIAS_CXL(CXL_DEVICE_PORT);

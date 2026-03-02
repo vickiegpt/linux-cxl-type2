@@ -1,0 +1,99 @@
+Subject: [PATCH RFC v2 0/17] Initial CXL.cache device support
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:15 -0600
+Message-Id: <20251111214032.8188-1-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+v2 Change log:
+ - Reworked cache id patches
+ - Reordered several patches for flow
+ - Add/delete cxl_cachedev in cxl/core/cachedev.c (Jonathan)
+ - Add doc for struct cxl_cachedev (Jonathan)
+ - Updated switch port and endpoint port set up to mesh with new delayed
+   dport set up
+ - Added comment about why cxl_cache probe is synchronous (Jonathan)
+ - Bug fixes, cleanups, and renames in snoop filter patch (Jonathan &
+   Dave)
+ - Removed serial attribute from cxl_cachedev (Jonathan)
+ - Added NULLs and removed commas from attribute groups (Jonathan)
+ - Bug fixes for cache management attributes (Dave)
+ - Added documentation for new cachedev attributes under
+   Documentation/ABI (Dave)
+
+This patch series adds initial CXL.cache support. What I have here only
+allows for adding a cache device to the system, programming/validating
+the system configuration with respect to cache devices, and some basic
+cache reporting/management.
+
+The general philosophy is to have an endpoint/vendor-specific driver
+that runs through the same steps of adding a cxl_memdev, but for the
+cache portion of the device (both type 1 & 2). Getting cache support for
+a CXL device should be as simple as: get cache information, set up the
+memory region (see below), and then calling devm_cxl_add_cachedev().
+
+There's a couple of things missing from this set:
+
+1) Missing an endpoint driver
+2) RAS Support
+3) Mapping/Reserving host memory used for CXL cache(s)
+
+	I'm thinking the way it will work is the endpoint driver requests a
+	DMA region for the cache, but I haven't looked into it. Any
+	thoughts/ideas are appreciated!
+
+*Important Note*: The first patch is only there for context. It's
+required for the set to work, but it should be picked up as part of
+Smita's soft reserved set.
+
+Ben Cheatham (16):
+  cxl: Move struct cxl_dev_state definition
+  cxl/core: Add function for getting CXL cache info
+  cxl/core: Add CXL.cache device struct
+  cxl/cache: Add cxl_cache driver
+  cxl: Replace cxl_mem_find_port() with cxl_dev_find_port()
+  cxl: Change cxl_ep_load() to use struct device * parameter
+  cxl/core: Update devm_cxl_enumerate_ports()
+  cxl/port: Split endpoint port probe on device type
+  cxl/cache, mem: Prevent RAS register mapping race
+  cxl/core, port: Update devm_cxl_add_endpoint()
+  cxl/core: Add CXL snoop filter setup and allocation
+  cxl/core: Add cache id verification
+  cxl/port: Add cache id programming
+  cxl/port: Bypass cache id for singleton cache devices
+  cxl/core: Add cache device attributes
+  cxl/core: Add cache device cache management attributes
+
+Dan Williams (1):
+  cxl/port: Arrange for always synchronous endpoint attach
+
+ Documentation/ABI/testing/sysfs-bus-cxl |  31 +
+ drivers/cxl/Kconfig                     |  14 +
+ drivers/cxl/Makefile                    |   2 +
+ drivers/cxl/cache.c                     | 152 +++++
+ drivers/cxl/core/Makefile               |   1 +
+ drivers/cxl/core/cachedev.c             | 289 ++++++++
+ drivers/cxl/core/pci.c                  | 140 ++++
+ drivers/cxl/core/port.c                 | 842 ++++++++++++++++++++++--
+ drivers/cxl/core/region.c               |  25 +-
+ drivers/cxl/core/regs.c                 |  27 +
+ drivers/cxl/cxl.h                       | 204 +++++-
+ drivers/cxl/cxlcache.h                  |  48 ++
+ drivers/cxl/cxlmem.h                    | 113 +---
+ drivers/cxl/cxlpci.h                    |  10 +
+ drivers/cxl/mem.c                       |  55 +-
+ drivers/cxl/pci.c                       |   2 +-
+ drivers/cxl/port.c                      | 129 +++-
+ drivers/cxl/private.h                   |  19 +
+ 18 files changed, 1877 insertions(+), 226 deletions(-)
+ create mode 100644 drivers/cxl/cache.c
+ create mode 100644 drivers/cxl/core/cachedev.c
+ create mode 100644 drivers/cxl/cxlcache.h
+ create mode 100644 drivers/cxl/private.h
+
+-- 
+2.51.1
+
+
+

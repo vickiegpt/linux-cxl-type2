@@ -1,0 +1,4006 @@
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 1/17] cxl/port: Arrange for always synchronous endpoint
+ attach
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Tue, 11 Nov 2025 15:40:16 -0600
+Message-Id: <20251111214032.8188-2-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Make it so that upon return from devm_cxl_add_endpoint() that cxl_mem_probe() can
+assume that the endpoint has had a chance to complete cxl_port_probe().
+I.e. cxl_port module loading has completed prior to device registration.
+
+MODULE_SOFTDEP() is not sufficient for this purpose, but a hard link-time
+dependency is reliable.
+
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+---
+This patch is just for context, I'm aware that Smita is picking this up
+in her soft reserve set.
+
+---
+ drivers/cxl/mem.c     | 44 +------------------------------------------
+ drivers/cxl/port.c    | 41 ++++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/private.h | 15 +++++++++++++++
+ 3 files changed, 57 insertions(+), 43 deletions(-)
+ create mode 100644 drivers/cxl/private.h
+
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index 6e6777b7bafb..e49d57bee2e9 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -5,6 +5,7 @@
+ #include <linux/module.h>
+ #include <linux/pci.h>
+ 
++#include "private.h"
+ #include "cxlmem.h"
+ #include "cxlpci.h"
+ 
+@@ -45,44 +46,6 @@ static int cxl_mem_dpa_show(struct seq_file *file, void *data)
+ 	return 0;
+ }
+ 
+-static int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
+-				 struct cxl_dport *parent_dport)
+-{
+-	struct cxl_port *parent_port = parent_dport->port;
+-	struct cxl_port *endpoint, *iter, *down;
+-	int rc;
+-
+-	/*
+-	 * Now that the path to the root is established record all the
+-	 * intervening ports in the chain.
+-	 */
+-	for (iter = parent_port, down = NULL; !is_cxl_root(iter);
+-	     down = iter, iter = to_cxl_port(iter->dev.parent)) {
+-		struct cxl_ep *ep;
+-
+-		ep = cxl_ep_load(iter, cxlmd);
+-		ep->next = down;
+-	}
+-
+-	/* Note: endpoint port component registers are derived from @cxlds */
+-	endpoint = devm_cxl_add_port(host, &cxlmd->dev, CXL_RESOURCE_NONE,
+-				     parent_dport);
+-	if (IS_ERR(endpoint))
+-		return PTR_ERR(endpoint);
+-
+-	rc = cxl_endpoint_autoremove(cxlmd, endpoint);
+-	if (rc)
+-		return rc;
+-
+-	if (!endpoint->dev.driver) {
+-		dev_err(&cxlmd->dev, "%s failed probe\n",
+-			dev_name(&endpoint->dev));
+-		return -ENXIO;
+-	}
+-
+-	return 0;
+-}
+-
+ static int cxl_debugfs_poison_inject(void *data, u64 dpa)
+ {
+ 	struct cxl_memdev *cxlmd = data;
+@@ -258,8 +221,3 @@ MODULE_DESCRIPTION("CXL: Memory Expansion");
+ MODULE_LICENSE("GPL v2");
+ MODULE_IMPORT_NS("CXL");
+ MODULE_ALIAS_CXL(CXL_DEVICE_MEMORY_EXPANDER);
+-/*
+- * create_endpoint() wants to validate port driver attach immediately after
+- * endpoint registration.
+- */
+-MODULE_SOFTDEP("pre: cxl_port");
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index 51c8f2f84717..d5fd0c5ae49b 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -6,6 +6,7 @@
+ 
+ #include "cxlmem.h"
+ #include "cxlpci.h"
++#include "private.h"
+ 
+ /**
+  * DOC: cxl port
+@@ -156,10 +157,50 @@ static struct cxl_driver cxl_port_driver = {
+ 	.probe = cxl_port_probe,
+ 	.id = CXL_DEVICE_PORT,
+ 	.drv = {
++		.probe_type = PROBE_FORCE_SYNCHRONOUS,
+ 		.dev_groups = cxl_port_attribute_groups,
+ 	},
+ };
+ 
++int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
++			  struct cxl_dport *parent_dport)
++{
++	struct cxl_port *parent_port = parent_dport->port;
++	struct cxl_port *endpoint, *iter, *down;
++	int rc;
++
++	/*
++	 * Now that the path to the root is established record all the
++	 * intervening ports in the chain.
++	 */
++	for (iter = parent_port, down = NULL; !is_cxl_root(iter);
++	     down = iter, iter = to_cxl_port(iter->dev.parent)) {
++		struct cxl_ep *ep;
++
++		ep = cxl_ep_load(iter, cxlmd);
++		ep->next = down;
++	}
++
++	/* Note: endpoint port component registers are derived from @cxlds */
++	endpoint = devm_cxl_add_port(host, &cxlmd->dev, CXL_RESOURCE_NONE,
++				     parent_dport);
++	if (IS_ERR(endpoint))
++		return PTR_ERR(endpoint);
++
++	rc = cxl_endpoint_autoremove(cxlmd, endpoint);
++	if (rc)
++		return rc;
++
++	if (!endpoint->dev.driver) {
++		dev_err(&cxlmd->dev, "%s failed probe\n",
++			dev_name(&endpoint->dev));
++		return -ENXIO;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_add_endpoint, "CXL");
++
+ static int __init cxl_port_init(void)
+ {
+ 	return cxl_driver_register(&cxl_port_driver);
+diff --git a/drivers/cxl/private.h b/drivers/cxl/private.h
+new file mode 100644
+index 000000000000..ff517452e735
+--- /dev/null
++++ b/drivers/cxl/private.h
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright(c) 2025 Intel Corporation. */
++
++/*
++ * Private interfaces betwen common drivers ("cxl_mem", "cxl_port") and
++ * the cxl_core.
++ */
++
++#include "cxl.h"
++
++#ifndef __CXL_PRIVATE_H__
++#define __CXL_PRIVATE_H__
++int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
++			  struct cxl_dport *parent_dport);
++#endif /* __CXL_PRIVATE_H__ */
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 2/17] cxl: Move struct cxl_dev_state definition
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:17 -0600
+Message-Id: <20251111214032.8188-3-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Move struct cxl_dev_state (and associated structs) from cxlmem.h to
+cxl.h. This is in preparation of adding a new CXL cache device type
+that will also use cxl_dev_state.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/cxl.h    | 110 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/cxlmem.h | 109 ------------------------------------------
+ 2 files changed, 110 insertions(+), 109 deletions(-)
+
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 231ddccf8977..1950cf3d5399 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -12,6 +12,7 @@
+ #include <linux/node.h>
+ #include <linux/io.h>
+ #include <linux/range.h>
++#include <cxl/mailbox.h>
+ 
+ extern const struct nvdimm_security_ops *cxl_security_ops;
+ 
+@@ -707,6 +708,115 @@ struct cxl_ep {
+ 	struct cxl_port *next;
+ };
+ 
++/*
++ * enum cxl_devtype - delineate type-2 from a generic type-3 device
++ * @CXL_DEVTYPE_DEVMEM - Vendor specific CXL Type-2 device implementing HDM-D or
++ *			 HDM-DB, no requirement that this device implements a
++ *			 mailbox, or other memory-device-standard manageability
++ *			 flows.
++ * @CXL_DEVTYPE_CLASSMEM - Common class definition of a CXL Type-3 device with
++ *			   HDM-H and class-mandatory memory device registers
++ */
++enum cxl_devtype {
++	CXL_DEVTYPE_DEVMEM,
++	CXL_DEVTYPE_CLASSMEM,
++};
++
++/**
++ * struct cxl_dpa_perf - DPA performance property entry
++ * @dpa_range: range for DPA address
++ * @coord: QoS performance data (i.e. latency, bandwidth)
++ * @cdat_coord: raw QoS performance data from CDAT
++ * @qos_class: QoS Class cookies
++ */
++struct cxl_dpa_perf {
++	struct range dpa_range;
++	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
++	struct access_coordinate cdat_coord[ACCESS_COORDINATE_MAX];
++	int qos_class;
++};
++
++/**
++ * struct cxl_dpa_partition - DPA partition descriptor
++ * @res: shortcut to the partition in the DPA resource tree (cxlds->dpa_res)
++ * @perf: performance attributes of the partition from CDAT
++ * @mode: operation mode for the DPA capacity, e.g. ram, pmem, dynamic...
++ */
++struct cxl_dpa_partition {
++	struct resource res;
++	struct cxl_dpa_perf perf;
++	enum cxl_partition_mode mode;
++};
++
++#define CXL_NR_PARTITIONS_MAX 2
++
++struct cxl_dpa_info {
++	u64 size;
++	struct cxl_dpa_part_info {
++		struct range range;
++		enum cxl_partition_mode mode;
++	} part[CXL_NR_PARTITIONS_MAX];
++	int nr_partitions;
++};
++
++/**
++ * struct cxl_dev_state - The driver device state
++ *
++ * cxl_dev_state represents the CXL driver/device state.  It provides an
++ * interface to mailbox commands as well as some cached data about the device.
++ * Currently only memory devices are represented.
++ *
++ * @dev: The device associated with this CXL state
++ * @cxlmd: The device representing the CXL.mem capabilities of @dev
++ * @reg_map: component and ras register mapping parameters
++ * @regs: Parsed register blocks
++ * @cxl_dvsec: Offset to the PCIe device DVSEC
++ * @rcd: operating in RCD mode (CXL 3.0 9.11.8 CXL Devices Attached to an RCH)
++ * @media_ready: Indicate whether the device media is usable
++ * @dpa_res: Overall DPA resource tree for the device
++ * @part: DPA partition array
++ * @nr_partitions: Number of DPA partitions
++ * @serial: PCIe Device Serial Number
++ * @type: Generic Memory Class device or Vendor Specific Memory device
++ * @cxl_mbox: CXL mailbox context
++ * @cxlfs: CXL features context
++ */
++struct cxl_dev_state {
++	struct device *dev;
++	struct cxl_memdev *cxlmd;
++	struct cxl_register_map reg_map;
++	struct cxl_regs regs;
++	int cxl_dvsec;
++	bool rcd;
++	bool media_ready;
++	struct resource dpa_res;
++	struct cxl_dpa_partition part[CXL_NR_PARTITIONS_MAX];
++	unsigned int nr_partitions;
++	u64 serial;
++	enum cxl_devtype type;
++	struct cxl_mailbox cxl_mbox;
++#ifdef CONFIG_CXL_FEATURES
++	struct cxl_features_state *cxlfs;
++#endif
++};
++
++static inline resource_size_t cxl_pmem_size(struct cxl_dev_state *cxlds)
++{
++	/*
++	 * Static PMEM may be at partition index 0 when there is no static RAM
++	 * capacity.
++	 */
++	for (int i = 0; i < cxlds->nr_partitions; i++)
++		if (cxlds->part[i].mode == CXL_PARTMODE_PMEM)
++			return resource_size(&cxlds->part[i].res);
++	return 0;
++}
++
++static inline struct cxl_dev_state *mbox_to_cxlds(struct cxl_mailbox *cxl_mbox)
++{
++	return dev_get_drvdata(cxl_mbox->host);
++}
++
+ /**
+  * struct cxl_region_ref - track a region's interest in a port
+  * @port: point in topology to install this reference
+diff --git a/drivers/cxl/cxlmem.h b/drivers/cxl/cxlmem.h
+index 434031a0c1f7..0b6339916559 100644
+--- a/drivers/cxl/cxlmem.h
++++ b/drivers/cxl/cxlmem.h
+@@ -105,17 +105,6 @@ int devm_cxl_dpa_reserve(struct cxl_endpoint_decoder *cxled,
+ 			 resource_size_t base, resource_size_t len,
+ 			 resource_size_t skipped);
+ 
+-#define CXL_NR_PARTITIONS_MAX 2
+-
+-struct cxl_dpa_info {
+-	u64 size;
+-	struct cxl_dpa_part_info {
+-		struct range range;
+-		enum cxl_partition_mode mode;
+-	} part[CXL_NR_PARTITIONS_MAX];
+-	int nr_partitions;
+-};
+-
+ int cxl_dpa_setup(struct cxl_dev_state *cxlds, const struct cxl_dpa_info *info);
+ 
+ static inline struct cxl_ep *cxl_ep_load(struct cxl_port *port,
+@@ -365,104 +354,6 @@ struct cxl_security_state {
+ 	struct kernfs_node *sanitize_node;
+ };
+ 
+-/*
+- * enum cxl_devtype - delineate type-2 from a generic type-3 device
+- * @CXL_DEVTYPE_DEVMEM - Vendor specific CXL Type-2 device implementing HDM-D or
+- *			 HDM-DB, no requirement that this device implements a
+- *			 mailbox, or other memory-device-standard manageability
+- *			 flows.
+- * @CXL_DEVTYPE_CLASSMEM - Common class definition of a CXL Type-3 device with
+- *			   HDM-H and class-mandatory memory device registers
+- */
+-enum cxl_devtype {
+-	CXL_DEVTYPE_DEVMEM,
+-	CXL_DEVTYPE_CLASSMEM,
+-};
+-
+-/**
+- * struct cxl_dpa_perf - DPA performance property entry
+- * @dpa_range: range for DPA address
+- * @coord: QoS performance data (i.e. latency, bandwidth)
+- * @cdat_coord: raw QoS performance data from CDAT
+- * @qos_class: QoS Class cookies
+- */
+-struct cxl_dpa_perf {
+-	struct range dpa_range;
+-	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
+-	struct access_coordinate cdat_coord[ACCESS_COORDINATE_MAX];
+-	int qos_class;
+-};
+-
+-/**
+- * struct cxl_dpa_partition - DPA partition descriptor
+- * @res: shortcut to the partition in the DPA resource tree (cxlds->dpa_res)
+- * @perf: performance attributes of the partition from CDAT
+- * @mode: operation mode for the DPA capacity, e.g. ram, pmem, dynamic...
+- */
+-struct cxl_dpa_partition {
+-	struct resource res;
+-	struct cxl_dpa_perf perf;
+-	enum cxl_partition_mode mode;
+-};
+-
+-/**
+- * struct cxl_dev_state - The driver device state
+- *
+- * cxl_dev_state represents the CXL driver/device state.  It provides an
+- * interface to mailbox commands as well as some cached data about the device.
+- * Currently only memory devices are represented.
+- *
+- * @dev: The device associated with this CXL state
+- * @cxlmd: The device representing the CXL.mem capabilities of @dev
+- * @reg_map: component and ras register mapping parameters
+- * @regs: Parsed register blocks
+- * @cxl_dvsec: Offset to the PCIe device DVSEC
+- * @rcd: operating in RCD mode (CXL 3.0 9.11.8 CXL Devices Attached to an RCH)
+- * @media_ready: Indicate whether the device media is usable
+- * @dpa_res: Overall DPA resource tree for the device
+- * @part: DPA partition array
+- * @nr_partitions: Number of DPA partitions
+- * @serial: PCIe Device Serial Number
+- * @type: Generic Memory Class device or Vendor Specific Memory device
+- * @cxl_mbox: CXL mailbox context
+- * @cxlfs: CXL features context
+- */
+-struct cxl_dev_state {
+-	struct device *dev;
+-	struct cxl_memdev *cxlmd;
+-	struct cxl_register_map reg_map;
+-	struct cxl_regs regs;
+-	int cxl_dvsec;
+-	bool rcd;
+-	bool media_ready;
+-	struct resource dpa_res;
+-	struct cxl_dpa_partition part[CXL_NR_PARTITIONS_MAX];
+-	unsigned int nr_partitions;
+-	u64 serial;
+-	enum cxl_devtype type;
+-	struct cxl_mailbox cxl_mbox;
+-#ifdef CONFIG_CXL_FEATURES
+-	struct cxl_features_state *cxlfs;
+-#endif
+-};
+-
+-static inline resource_size_t cxl_pmem_size(struct cxl_dev_state *cxlds)
+-{
+-	/*
+-	 * Static PMEM may be at partition index 0 when there is no static RAM
+-	 * capacity.
+-	 */
+-	for (int i = 0; i < cxlds->nr_partitions; i++)
+-		if (cxlds->part[i].mode == CXL_PARTMODE_PMEM)
+-			return resource_size(&cxlds->part[i].res);
+-	return 0;
+-}
+-
+-static inline struct cxl_dev_state *mbox_to_cxlds(struct cxl_mailbox *cxl_mbox)
+-{
+-	return dev_get_drvdata(cxl_mbox->host);
+-}
+-
+ /**
+  * struct cxl_memdev_state - Generic Type-3 Memory Device Class driver data
+  *
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 3/17] cxl/core: Add function for getting CXL cache info
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:18 -0600
+Message-Id: <20251111214032.8188-4-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add a function for getting common CXL.cache information. This
+information will be stored in the struct cxl_cache_state member
+(cstate) of struct cxl_dev_state for easy access by endpoint drivers.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/core/pci.c | 53 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/cxl.h      | 13 +++++++++++
+ drivers/cxl/cxlcache.h |  7 ++++++
+ drivers/cxl/cxlpci.h   |  4 ++++
+ 4 files changed, 77 insertions(+)
+ create mode 100644 drivers/cxl/cxlcache.h
+
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 18825e1505d6..5b1cace8fc0f 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -7,6 +7,7 @@
+ #include <linux/pci.h>
+ #include <linux/pci-doe.h>
+ #include <linux/aer.h>
++#include <cxlcache.h>
+ #include <cxlpci.h>
+ #include <cxlmem.h>
+ #include <cxl.h>
+@@ -1258,3 +1259,55 @@ int cxl_port_get_possible_dports(struct cxl_port *port)
+ 
+ 	return ctx.count;
+ }
++EXPORT_SYMBOL_NS_GPL(cxl_port_get_possible_dports, "CXL");
++
++/**
++ * cxl_accel_read_cache_info - Get the CXL cache information of a CXL cache device
++ * @cxlds: CXL device state associated with cache device
++ *
++ * Returns 0 and populates the struct cxl_cache_state member of @cxlds on
++ * success, error otherwise.
++ */
++int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds)
++{
++	struct cxl_cache_state *cstate = &cxlds->cstate;
++	struct pci_dev *pdev;
++	int dvsec, rc;
++	u16 cap, cap2;
++
++	if (!dev_is_pci(cxlds->dev))
++		return -EINVAL;
++	pdev = to_pci_dev(cxlds->dev);
++
++	dvsec = cxlds->cxl_dvsec;
++
++	rc = pci_read_config_word(pdev, dvsec + CXL_DVSEC_CAP_OFFSET, &cap);
++	if (rc)
++		return rc;
++
++	if (!(cap & CXL_DVSEC_CACHE_CAPABLE))
++		return -ENXIO;
++
++	rc = pci_read_config_word(pdev, dvsec + CXL_DVSEC_CAP2_OFFSET, &cap2);
++	if (rc)
++		return rc;
++
++	/* CXL 3.2 8.1.3.7 DVSEC CXL Capability2 for encoding */
++	switch (FIELD_GET(CXL_DVSEC_CACHE_UNIT_MASK, cap2)) {
++	case 1:
++		cstate->unit = 64 * SZ_1K;
++		break;
++	case 2:
++		cstate->unit = SZ_1M;
++		break;
++	default:
++		return -ENXIO;
++	}
++
++	cstate->size = FIELD_GET(CXL_DVSEC_CACHE_SIZE_MASK, cap2) * cstate->unit;
++	if (!cstate->size)
++		return -ENXIO;
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_accel_read_cache_info, "CXL");
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 1950cf3d5399..259d806fb3e3 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -759,6 +759,17 @@ struct cxl_dpa_info {
+ 	int nr_partitions;
+ };
+ 
++
++/**
++ * struct cxl_cache_state - State of a device's CXL cache
++ * @size: Size of cache in bytes
++ * @unit: Unit size of cache in bytes
++ */
++struct cxl_cache_state {
++	u64 size;
++	u32 unit;
++};
++
+ /**
+  * struct cxl_dev_state - The driver device state
+  *
+@@ -779,6 +790,7 @@ struct cxl_dpa_info {
+  * @serial: PCIe Device Serial Number
+  * @type: Generic Memory Class device or Vendor Specific Memory device
+  * @cxl_mbox: CXL mailbox context
++ * @cstate: CXL cache state and capabilities
+  * @cxlfs: CXL features context
+  */
+ struct cxl_dev_state {
+@@ -795,6 +807,7 @@ struct cxl_dev_state {
+ 	u64 serial;
+ 	enum cxl_devtype type;
+ 	struct cxl_mailbox cxl_mbox;
++	struct cxl_cache_state cstate;
+ #ifdef CONFIG_CXL_FEATURES
+ 	struct cxl_features_state *cxlfs;
+ #endif
+diff --git a/drivers/cxl/cxlcache.h b/drivers/cxl/cxlcache.h
+new file mode 100644
+index 000000000000..8f8597755947
+--- /dev/null
++++ b/drivers/cxl/cxlcache.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __CXL_CACHE_H__
++#define __CXL_CACHE_H__
++#include "cxl.h"
++
++int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds);
++#endif
+diff --git a/drivers/cxl/cxlpci.h b/drivers/cxl/cxlpci.h
+index 7ae621e618e7..18230e4f677c 100644
+--- a/drivers/cxl/cxlpci.h
++++ b/drivers/cxl/cxlpci.h
+@@ -17,10 +17,14 @@
+ /* CXL 2.0 8.1.3: PCIe DVSEC for CXL Device */
+ #define CXL_DVSEC_PCIE_DEVICE					0
+ #define   CXL_DVSEC_CAP_OFFSET		0xA
++#define     CXL_DVSEC_CACHE_CAPABLE	BIT(0)
+ #define     CXL_DVSEC_MEM_CAPABLE	BIT(2)
+ #define     CXL_DVSEC_HDM_COUNT_MASK	GENMASK(5, 4)
+ #define   CXL_DVSEC_CTRL_OFFSET		0xC
+ #define     CXL_DVSEC_MEM_ENABLE	BIT(2)
++#define   CXL_DVSEC_CAP2_OFFSET		0x16
++#define     CXL_DVSEC_CACHE_UNIT_MASK	GENMASK(3, 0)
++#define     CXL_DVSEC_CACHE_SIZE_MASK	GENMASK(15, 8)
+ #define   CXL_DVSEC_RANGE_SIZE_HIGH(i)	(0x18 + (i * 0x10))
+ #define   CXL_DVSEC_RANGE_SIZE_LOW(i)	(0x1C + (i * 0x10))
+ #define     CXL_DVSEC_MEM_INFO_VALID	BIT(0)
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 4/17] cxl/core: Add CXL.cache device struct
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:19 -0600
+Message-Id: <20251111214032.8188-5-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add a new CXL.cache device (struct cxl_cachedev) that is the cache
+analogue to struct cxl_memdev. This device will be created by
+endpoint vendor-specific drivers to enable and manage the cache
+capabilities of the endpoint.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+---
+ drivers/cxl/core/Makefile   |  1 +
+ drivers/cxl/core/cachedev.c | 95 +++++++++++++++++++++++++++++++++++++
+ drivers/cxl/core/port.c     |  3 ++
+ drivers/cxl/cxl.h           |  3 ++
+ drivers/cxl/cxlcache.h      | 25 ++++++++++
+ drivers/cxl/private.h       |  4 ++
+ 6 files changed, 131 insertions(+)
+ create mode 100644 drivers/cxl/core/cachedev.c
+
+diff --git a/drivers/cxl/core/Makefile b/drivers/cxl/core/Makefile
+index 5ad8fef210b5..94db05d1f351 100644
+--- a/drivers/cxl/core/Makefile
++++ b/drivers/cxl/core/Makefile
+@@ -9,6 +9,7 @@ cxl_core-y := port.o
+ cxl_core-y += pmem.o
+ cxl_core-y += regs.o
+ cxl_core-y += memdev.o
++cxl_core-y += cachedev.o
+ cxl_core-y += mbox.o
+ cxl_core-y += pci.o
+ cxl_core-y += hdm.o
+diff --git a/drivers/cxl/core/cachedev.c b/drivers/cxl/core/cachedev.c
+new file mode 100644
+index 000000000000..5693a63baa9b
+--- /dev/null
++++ b/drivers/cxl/core/cachedev.c
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (C) 2025 Advanced Micro Devices, Inc. */
++#include <linux/device.h>
++#include <linux/pci.h>
++
++#include "../cxlcache.h"
++#include "private.h"
++
++static DEFINE_IDA(cxl_cachedev_ida);
++
++static void cxl_cachedev_release(struct device *dev)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++
++	ida_free(&cxl_cachedev_ida, cxlcd->id);
++	kfree(cxlcd);
++}
++
++static void cxl_cachedev_unregister(void *dev)
++{
++	struct cxl_cachedev *cxlcd = dev;
++
++	cxlcd->cxlds = NULL;
++	device_del(&cxlcd->dev);
++	put_device(&cxlcd->dev);
++}
++
++static char *cxl_cachedev_devnode(const struct device *dev, umode_t *mode,
++				  kuid_t *uid, kgid_t *gid)
++{
++	return kasprintf(GFP_KERNEL, "cxl/%s", dev_name(dev));
++}
++
++static const struct device_type cxl_cachedev_type = {
++	.name = "cxl_cachedev",
++	.release = cxl_cachedev_release,
++	.devnode = cxl_cachedev_devnode,
++};
++
++bool is_cxl_cachedev(const struct device *dev)
++{
++	return dev->type == &cxl_cachedev_type;
++}
++EXPORT_SYMBOL_NS_GPL(is_cxl_cachedev, "CXL");
++
++static struct lock_class_key cxl_cachedev_key;
++
++struct cxl_cachedev *cxl_cachedev_alloc(struct cxl_dev_state *cxlds)
++{
++	struct device *dev;
++	int rc;
++
++	struct cxl_cachedev *cxlcd __free(kfree) =
++		kzalloc(sizeof(*cxlcd), GFP_KERNEL);
++	if (!cxlcd)
++		return ERR_PTR(-ENOMEM);
++
++	rc = ida_alloc(&cxl_cachedev_ida, GFP_KERNEL);
++	if (rc < 0)
++		return ERR_PTR(rc);
++
++	cxlcd->id = rc;
++	cxlcd->depth = -1;
++	cxlcd->cxlds = cxlds;
++	cxlds->cxlcd = cxlcd;
++	cxlcd->endpoint = ERR_PTR(-ENXIO);
++
++	dev = &cxlcd->dev;
++	device_initialize(dev);
++	lockdep_set_class(&dev->mutex, &cxl_cachedev_key);
++	dev->parent = cxlds->dev;
++	dev->bus = &cxl_bus_type;
++	dev->type = &cxl_cachedev_type;
++	device_set_pm_not_required(dev);
++
++	return_ptr(cxlcd);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_cachedev_alloc, "CXL");
++
++struct cxl_cachedev *devm_cxl_cachedev_add_or_reset(struct device *host,
++						    struct cxl_cachedev *cxlcd)
++{
++	int rc;
++
++	rc = device_add(&cxlcd->dev);
++	if (rc)
++		return ERR_PTR(rc);
++
++	rc = devm_add_action_or_reset(host, cxl_cachedev_unregister, cxlcd);
++	if (rc)
++		return ERR_PTR(rc);
++
++	return cxlcd;
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_cachedev_add_or_reset, "CXL");
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 8128fd2b5b31..603cf862e311 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -11,6 +11,7 @@
+ #include <linux/idr.h>
+ #include <linux/node.h>
+ #include <cxl/einj.h>
++#include <cxlcache.h>
+ #include <cxlmem.h>
+ #include <cxlpci.h>
+ #include <cxl.h>
+@@ -77,6 +78,8 @@ static int cxl_device_id(const struct device *dev)
+ 		return CXL_DEVICE_REGION;
+ 	if (dev->type == &cxl_pmu_type)
+ 		return CXL_DEVICE_PMU;
++	if (is_cxl_cachedev(dev))
++		return CXL_DEVICE_ACCELERATOR;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 259d806fb3e3..4cf8ca3a2494 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -779,6 +779,7 @@ struct cxl_cache_state {
+  *
+  * @dev: The device associated with this CXL state
+  * @cxlmd: The device representing the CXL.mem capabilities of @dev
++ * @cxlcd: The device representing the CXL.cache capabilities of @dev
+  * @reg_map: component and ras register mapping parameters
+  * @regs: Parsed register blocks
+  * @cxl_dvsec: Offset to the PCIe device DVSEC
+@@ -796,6 +797,7 @@ struct cxl_cache_state {
+ struct cxl_dev_state {
+ 	struct device *dev;
+ 	struct cxl_memdev *cxlmd;
++	struct cxl_cachedev *cxlcd;
+ 	struct cxl_register_map reg_map;
+ 	struct cxl_regs regs;
+ 	int cxl_dvsec;
+@@ -982,6 +984,7 @@ void cxl_driver_unregister(struct cxl_driver *cxl_drv);
+ #define CXL_DEVICE_PMEM_REGION		7
+ #define CXL_DEVICE_DAX_REGION		8
+ #define CXL_DEVICE_PMU			9
++#define CXL_DEVICE_ACCELERATOR		10
+ 
+ #define MODULE_ALIAS_CXL(type) MODULE_ALIAS("cxl:t" __stringify(type) "*")
+ #define CXL_MODALIAS_FMT "cxl:t%d"
+diff --git a/drivers/cxl/cxlcache.h b/drivers/cxl/cxlcache.h
+index 8f8597755947..24ec8dddefe7 100644
+--- a/drivers/cxl/cxlcache.h
++++ b/drivers/cxl/cxlcache.h
+@@ -3,5 +3,30 @@
+ #define __CXL_CACHE_H__
+ #include "cxl.h"
+ 
++/**
++ * struct cxl_cachedev - CXL bus object representing a cache-capable CXL device
++ * @dev: driver core device object
++ * @cxlds: device state backing this device
++ * @endpoint: connection to the CXL port topology for this device
++ * @ops: caller specific probe routine
++ * @id: id number of this cachedev instance
++ * @depth: endpoint port depth in hierarchy
++ */
++struct cxl_cachedev {
++	struct device dev;
++	struct cxl_dev_state *cxlds;
++	struct cxl_port *endpoint;
++	const struct cxl_dev_ops *ops;
++	int id;
++	int depth;
++};
++
++static inline struct cxl_cachedev *to_cxl_cachedev(struct device *dev)
++{
++	return container_of(dev, struct cxl_cachedev, dev);
++}
++
++bool is_cxl_cachedev(const struct device *dev);
++
+ int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds);
+ #endif
+diff --git a/drivers/cxl/private.h b/drivers/cxl/private.h
+index ff517452e735..25e6bce2457f 100644
+--- a/drivers/cxl/private.h
++++ b/drivers/cxl/private.h
+@@ -12,4 +12,8 @@
+ #define __CXL_PRIVATE_H__
+ int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
+ 			  struct cxl_dport *parent_dport);
++
++struct cxl_cachedev *cxl_cachedev_alloc(struct cxl_dev_state *cxlds);
++struct cxl_cachedev *devm_cxl_cachedev_add_or_reset(struct device *host,
++						    struct cxl_cachedev *cxlcd);
+ #endif /* __CXL_PRIVATE_H__ */
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 5/17] cxl/cache: Add cxl_cache driver
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:20 -0600
+Message-Id: <20251111214032.8188-6-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add the cxl_cache driver which will manage struct cxl_cachdev devices.
+This driver will provide common management functions for some of a cache
+capable endpoint. This driver will also be responsible for validating
+the system's CXL.cache configuration.
+
+The driver expects the device's cache capabilities to be prefetched by
+the endpoint-specific driver. The required capabilities can be gotten by
+calling cxl_accel_get_cache_info().
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/Kconfig    | 14 ++++++++
+ drivers/cxl/Makefile   |  2 ++
+ drivers/cxl/cache.c    | 80 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/cxlcache.h |  2 ++
+ 4 files changed, 98 insertions(+)
+ create mode 100644 drivers/cxl/cache.c
+
+diff --git a/drivers/cxl/Kconfig b/drivers/cxl/Kconfig
+index 48b7314afdb8..6b07212b554a 100644
+--- a/drivers/cxl/Kconfig
++++ b/drivers/cxl/Kconfig
+@@ -233,4 +233,18 @@ config CXL_MCE
+ 	def_bool y
+ 	depends on X86_MCE && MEMORY_FAILURE
+ 
++config CXL_CACHE
++	tristate "CXL: Cache Management Support"
++	depends on CXL_BUS
++	help
++	  Enables a driver that manages the CXL.cache capabilities of a CXL.cache
++	  capable CXL device. This driver validates and provides support for
++	  programming the CXL cache device topology. This driver is required for
++	  using multiple CXL.cache devices (Type 1 or Type 2) below a given
++	  CXL 3.0+ capable PCIe Root Port. This driver only provides CXL cache
++	  management and reporting capabilities, a vendor-specific device driver
++	  is expected to enable the full capabilities of the device.
++
++	  If unsure, say 'm'.
++
+ endif
+diff --git a/drivers/cxl/Makefile b/drivers/cxl/Makefile
+index 2caa90fa4bf2..1017206d6780 100644
+--- a/drivers/cxl/Makefile
++++ b/drivers/cxl/Makefile
+@@ -13,9 +13,11 @@ obj-$(CONFIG_CXL_ACPI) += cxl_acpi.o
+ obj-$(CONFIG_CXL_PMEM) += cxl_pmem.o
+ obj-$(CONFIG_CXL_MEM) += cxl_mem.o
+ obj-$(CONFIG_CXL_PCI) += cxl_pci.o
++obj-$(CONFIG_CXL_CACHE) += cxl_cache.o
+ 
+ cxl_port-y := port.o
+ cxl_acpi-y := acpi.o
+ cxl_pmem-y := pmem.o security.o
+ cxl_mem-y := mem.o
+ cxl_pci-y := pci.o
++cxl_cache-y := cache.o
+diff --git a/drivers/cxl/cache.c b/drivers/cxl/cache.c
+new file mode 100644
+index 000000000000..6f410fae9437
+--- /dev/null
++++ b/drivers/cxl/cache.c
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Copyright (C) 2025 Advanced Micro Devices, Inc. */
++#include "cxlcache.h"
++#include "private.h"
++
++/**
++ * DOC: cxl cache
++ *
++ * The cxl_cache driver is responsible for validating the CXL.cache system
++ * configuration and managing portions of the CXL cache of CXL.cache enabled
++ * devices in the system. This driver does not discover devices, a
++ * device-specific driver is required for discovery and portions of set up.
++ */
++
++/**
++ * devm_cxl_add_cachedev - Add a CXL cache device
++ * @host: devres alloc/release context and parent for the cachedev
++ * @cxlds: CXL device state to associate with the cachedev
++ * @ops: optional operations to run in cxl_cache::{probe,remove}() context
++ *
++ * Upon return the device will have had a chance to attach to the
++ * cxl_cache driver. This may fail if the CXL topology is not ready
++ * (hardware CXL link down, or software platform CXL root not attached)
++ * or the CXL.cache system configuration is invalid.
++ *
++ * The cache state of @cxlds needs to be populated before calling this function,
++ * use cxl_accel_read_cache_info() to do so.
++ */
++struct cxl_cachedev *devm_cxl_add_cachedev(struct device *host,
++					   struct cxl_dev_state *cxlds)
++{
++	struct cxl_cachedev *cxlcd;
++	int rc;
++
++	cxlcd = cxl_cachedev_alloc(cxlds);
++	if (IS_ERR(cxlcd))
++		return cxlcd;
++
++	rc = dev_set_name(&cxlcd->dev, "cache%d", cxlcd->id);
++	if (rc) {
++		put_device(&cxlcd->dev);
++		return ERR_PTR(rc);
++	}
++
++	cxlcd = devm_cxl_cachedev_add_or_reset(host, cxlcd);
++	if (IS_ERR(cxlcd))
++		return cxlcd;
++
++	guard(device)(&cxlcd->dev);
++	if (!cxlcd->dev.driver)
++		return ERR_PTR(-ENXIO);
++
++	return cxlcd;
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_add_cachedev, "CXL");
++
++static int cxl_cache_probe(struct device *dev)
++{
++	return 0;
++}
++
++static struct cxl_driver cxl_cache_driver = {
++	.name = "cxl_cache",
++	.probe = cxl_cache_probe,
++	.drv = {
++		/*
++		 * Needed to guarantee probe and set up order for Type 1/2
++		 * vendor drivers.
++		 */
++		.probe_type = PROBE_FORCE_SYNCHRONOUS,
++	},
++	.id = CXL_DEVICE_ACCELERATOR,
++};
++
++module_cxl_driver(cxl_cache_driver);
++
++MODULE_DESCRIPTION("CXL: Cache Management");
++MODULE_LICENSE("GPL");
++MODULE_IMPORT_NS("CXL");
++MODULE_ALIAS_CXL(CXL_DEVICE_ACCELERATOR);
+diff --git a/drivers/cxl/cxlcache.h b/drivers/cxl/cxlcache.h
+index 24ec8dddefe7..6409e25dd1b4 100644
+--- a/drivers/cxl/cxlcache.h
++++ b/drivers/cxl/cxlcache.h
+@@ -29,4 +29,6 @@ static inline struct cxl_cachedev *to_cxl_cachedev(struct device *dev)
+ bool is_cxl_cachedev(const struct device *dev);
+ 
+ int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds);
++struct cxl_cachedev *devm_cxl_add_cachedev(struct device *host,
++					   struct cxl_dev_state *cxlds);
+ #endif
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 6/17] cxl: Replace cxl_mem_find_port() with
+ cxl_dev_find_port()
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:21 -0600
+Message-Id: <20251111214032.8188-7-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Change cxl_mem_find_port() to take a struct device * instead of a struct
+cxl_memdev * in preparation for adding cache devices to the port
+hierarchy.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Reviewed-by: Jonathan Cameron <jonathan.cameron@huawei.com>
+---
+ drivers/cxl/core/port.c | 9 ++++++---
+ drivers/cxl/cxl.h       | 2 +-
+ drivers/cxl/mem.c       | 2 +-
+ drivers/cxl/pci.c       | 2 +-
+ 4 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 603cf862e311..4ac8f6f83d80 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1872,12 +1872,15 @@ struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev,
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_pci_find_port, "CXL");
+ 
+-struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd,
++struct cxl_port *cxl_dev_find_port(struct device *cxldev,
+ 				   struct cxl_dport **dport)
+ {
+-	return find_cxl_port(grandparent(&cxlmd->dev), dport);
++	if (!is_cxl_memdev(cxldev))
++		return NULL;
++
++	return find_cxl_port(grandparent(cxldev), dport);
+ }
+-EXPORT_SYMBOL_NS_GPL(cxl_mem_find_port, "CXL");
++EXPORT_SYMBOL_NS_GPL(cxl_dev_find_port, "CXL");
+ 
+ static int decoder_populate_targets(struct cxl_switch_decoder *cxlsd,
+ 				    struct cxl_port *port)
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 4cf8ca3a2494..5ef0fb71af91 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -890,7 +890,7 @@ void cxl_bus_rescan(void);
+ void cxl_bus_drain(void);
+ struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev,
+ 				   struct cxl_dport **dport);
+-struct cxl_port *cxl_mem_find_port(struct cxl_memdev *cxlmd,
++struct cxl_port *cxl_dev_find_port(struct device *cxldev,
+ 				   struct cxl_dport **dport);
+ bool schedule_cxl_memdev_detach(struct cxl_memdev *cxlmd);
+ 
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index e49d57bee2e9..d12c96b68c82 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -109,7 +109,7 @@ static int cxl_mem_probe(struct device *dev)
+ 		return rc;
+ 
+ 	struct cxl_port *parent_port __free(put_cxl_port) =
+-		cxl_mem_find_port(cxlmd, &dport);
++		cxl_dev_find_port(&cxlmd->dev, &dport);
+ 	if (!parent_port) {
+ 		dev_err(dev, "CXL port topology not found\n");
+ 		return -ENXIO;
+diff --git a/drivers/cxl/pci.c b/drivers/cxl/pci.c
+index bd100ac31672..58dcd0690ffd 100644
+--- a/drivers/cxl/pci.c
++++ b/drivers/cxl/pci.c
+@@ -827,7 +827,7 @@ static ssize_t rcd_pcie_cap_emit(struct device *dev, u16 offset, char *buf, size
+ 	struct device *root_dev;
+ 	struct cxl_dport *dport;
+ 	struct cxl_port *root __free(put_cxl_port) =
+-		cxl_mem_find_port(cxlmd, &dport);
++		cxl_dev_find_port(&cxlmd->dev, &dport);
+ 
+ 	if (!root)
+ 		return -ENXIO;
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 7/17] cxl: Change cxl_ep_load() to use struct device *
+ parameter
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:22 -0600
+Message-Id: <20251111214032.8188-8-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Once cache devices are added the devices stored in cxl_ep refs will no
+longer be gauranteed to be cxl_memdevs. Change cxl_ep_load() to use a
+struct device pointer to prepare for this.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/core/port.c   |  4 ++--
+ drivers/cxl/core/region.c | 25 +++++++++++++------------
+ drivers/cxl/cxlmem.h      |  4 ++--
+ drivers/cxl/port.c        |  2 +-
+ 4 files changed, 18 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 4ac8f6f83d80..2cccce49e3b4 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -1480,7 +1480,7 @@ static int port_has_memdev(struct device *dev, const void *data)
+ 	if (port->depth != ctx->depth)
+ 		return 0;
+ 
+-	return !!cxl_ep_load(port, ctx->cxlmd);
++	return !!cxl_ep_load(port, &ctx->cxlmd->dev);
+ }
+ 
+ static void cxl_detach_ep(void *data)
+@@ -1505,7 +1505,7 @@ static void cxl_detach_ep(void *data)
+ 		parent_port = to_cxl_port(port->dev.parent);
+ 		device_lock(&parent_port->dev);
+ 		device_lock(&port->dev);
+-		ep = cxl_ep_load(port, cxlmd);
++		ep = cxl_ep_load(port, &cxlmd->dev);
+ 		dev_dbg(&cxlmd->dev, "disconnect %s from %s\n",
+ 			ep ? dev_name(ep->ep) : "", dev_name(&port->dev));
+ 		cxl_ep_remove(port, ep);
+diff --git a/drivers/cxl/core/region.c b/drivers/cxl/core/region.c
+index b06fee1978ba..53ed3acbca30 100644
+--- a/drivers/cxl/core/region.c
++++ b/drivers/cxl/core/region.c
+@@ -265,8 +265,8 @@ static void cxl_region_decode_reset(struct cxl_region *cxlr, int count)
+ 		while (!is_cxl_root(to_cxl_port(iter->dev.parent)))
+ 			iter = to_cxl_port(iter->dev.parent);
+ 
+-		for (ep = cxl_ep_load(iter, cxlmd); iter;
+-		     iter = ep->next, ep = cxl_ep_load(iter, cxlmd)) {
++		for (ep = cxl_ep_load(iter, &cxlmd->dev); iter;
++		     iter = ep->next, ep = cxl_ep_load(iter, &cxlmd->dev)) {
+ 			struct cxl_region_ref *cxl_rr;
+ 			struct cxl_decoder *cxld;
+ 
+@@ -327,8 +327,8 @@ static int cxl_region_decode_commit(struct cxl_region *cxlr)
+ 
+ 		if (rc) {
+ 			/* programming @iter failed, teardown */
+-			for (ep = cxl_ep_load(iter, cxlmd); ep && iter;
+-			     iter = ep->next, ep = cxl_ep_load(iter, cxlmd)) {
++			for (ep = cxl_ep_load(iter, &cxlmd->dev); ep && iter;
++			     iter = ep->next, ep = cxl_ep_load(iter, &cxlmd->dev)) {
+ 				cxl_rr = cxl_rr_load(iter, cxlr);
+ 				cxld = cxl_rr->decoder;
+ 				if (cxld->reset)
+@@ -1013,7 +1013,8 @@ static int cxl_rr_ep_add(struct cxl_region_ref *cxl_rr,
+ 	struct cxl_port *port = cxl_rr->port;
+ 	struct cxl_region *cxlr = cxl_rr->region;
+ 	struct cxl_decoder *cxld = cxl_rr->decoder;
+-	struct cxl_ep *ep = cxl_ep_load(port, cxled_to_memdev(cxled));
++	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
++	struct cxl_ep *ep = cxl_ep_load(port, &cxlmd->dev);
+ 
+ 	if (ep) {
+ 		rc = xa_insert(&cxl_rr->endpoints, (unsigned long)cxled, ep,
+@@ -1088,7 +1089,7 @@ static int cxl_port_attach_region(struct cxl_port *port,
+ 				  struct cxl_endpoint_decoder *cxled, int pos)
+ {
+ 	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+-	struct cxl_ep *ep = cxl_ep_load(port, cxlmd);
++	struct cxl_ep *ep = cxl_ep_load(port, &cxlmd->dev);
+ 	struct cxl_region_ref *cxl_rr;
+ 	bool nr_targets_inc = false;
+ 	struct cxl_decoder *cxld;
+@@ -1265,7 +1266,7 @@ static int check_last_peer(struct cxl_endpoint_decoder *cxled,
+ 	}
+ 	cxled_peer = p->targets[pos - distance];
+ 	cxlmd_peer = cxled_to_memdev(cxled_peer);
+-	ep_peer = cxl_ep_load(port, cxlmd_peer);
++	ep_peer = cxl_ep_load(port, &cxlmd_peer->dev);
+ 	if (ep->dport != ep_peer->dport) {
+ 		dev_dbg(&cxlr->dev,
+ 			"%s:%s: %s:%s pos %d mismatched peer %s:%s\n",
+@@ -1332,7 +1333,7 @@ static int cxl_port_setup_targets(struct cxl_port *port,
+ 	struct cxl_port *parent_port = to_cxl_port(port->dev.parent);
+ 	struct cxl_region_ref *cxl_rr = cxl_rr_load(port, cxlr);
+ 	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+-	struct cxl_ep *ep = cxl_ep_load(port, cxlmd);
++	struct cxl_ep *ep = cxl_ep_load(port, &cxlmd->dev);
+ 	struct cxl_region_params *p = &cxlr->params;
+ 	struct cxl_decoder *cxld = cxl_rr->decoder;
+ 	struct cxl_switch_decoder *cxlsd;
+@@ -1581,8 +1582,8 @@ static void cxl_region_teardown_targets(struct cxl_region *cxlr)
+ 		while (!is_cxl_root(to_cxl_port(iter->dev.parent)))
+ 			iter = to_cxl_port(iter->dev.parent);
+ 
+-		for (ep = cxl_ep_load(iter, cxlmd); iter;
+-		     iter = ep->next, ep = cxl_ep_load(iter, cxlmd))
++		for (ep = cxl_ep_load(iter, &cxlmd->dev); iter;
++		     iter = ep->next, ep = cxl_ep_load(iter, &cxlmd->dev))
+ 			cxl_port_reset_targets(iter, cxlr);
+ 	}
+ }
+@@ -1618,8 +1619,8 @@ static int cxl_region_setup_targets(struct cxl_region *cxlr)
+ 		 * Descend the topology tree programming / validating
+ 		 * targets while looking for conflicts.
+ 		 */
+-		for (ep = cxl_ep_load(iter, cxlmd); iter;
+-		     iter = ep->next, ep = cxl_ep_load(iter, cxlmd)) {
++		for (ep = cxl_ep_load(iter, &cxlmd->dev); iter;
++		     iter = ep->next, ep = cxl_ep_load(iter, &cxlmd->dev)) {
+ 			rc = cxl_port_setup_targets(iter, cxlr, cxled);
+ 			if (rc) {
+ 				cxl_region_teardown_targets(cxlr);
+diff --git a/drivers/cxl/cxlmem.h b/drivers/cxl/cxlmem.h
+index 0b6339916559..499792f339de 100644
+--- a/drivers/cxl/cxlmem.h
++++ b/drivers/cxl/cxlmem.h
+@@ -108,12 +108,12 @@ int devm_cxl_dpa_reserve(struct cxl_endpoint_decoder *cxled,
+ int cxl_dpa_setup(struct cxl_dev_state *cxlds, const struct cxl_dpa_info *info);
+ 
+ static inline struct cxl_ep *cxl_ep_load(struct cxl_port *port,
+-					 struct cxl_memdev *cxlmd)
++					 struct device *cxldev)
+ {
+ 	if (!port)
+ 		return NULL;
+ 
+-	return xa_load(&port->endpoints, (unsigned long)&cxlmd->dev);
++	return xa_load(&port->endpoints, (unsigned long)cxldev);
+ }
+ 
+ /*
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index d5fd0c5ae49b..c2fbdbfe0b6b 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -177,7 +177,7 @@ int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
+ 	     down = iter, iter = to_cxl_port(iter->dev.parent)) {
+ 		struct cxl_ep *ep;
+ 
+-		ep = cxl_ep_load(iter, cxlmd);
++		ep = cxl_ep_load(iter, &cxlmd->dev);
+ 		ep->next = down;
+ 	}
+ 
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 8/17] cxl/core: Update devm_cxl_enumerate_ports()
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:23 -0600
+Message-Id: <20251111214032.8188-9-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Update devm_cxl_enumerate_ports() to handle cxl_cachedev devices. After
+this commit cxl_cachedev's will be added to the CXL port hierarchy, but
+immediately fail endpoint port probe.
+
+Endpoint port probe will be updated to allow cxl cache devices in a
+following commit.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/cache.c     |  16 ++++++
+ drivers/cxl/core/port.c | 109 ++++++++++++++++++++++++++--------------
+ drivers/cxl/cxl.h       |   3 +-
+ drivers/cxl/mem.c       |   2 +-
+ drivers/cxl/port.c      |   3 ++
+ 5 files changed, 94 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/cxl/cache.c b/drivers/cxl/cache.c
+index 6f410fae9437..630452d53acc 100644
+--- a/drivers/cxl/cache.c
++++ b/drivers/cxl/cache.c
+@@ -56,6 +56,22 @@ EXPORT_SYMBOL_NS_GPL(devm_cxl_add_cachedev, "CXL");
+ 
+ static int cxl_cache_probe(struct device *dev)
+ {
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	struct cxl_dport *dport;
++	int rc;
++
++	rc = devm_cxl_enumerate_ports(dev, cxlds);
++	if (rc)
++		return rc;
++
++	struct cxl_port *parent_port __free(put_cxl_port) =
++		cxl_dev_find_port(dev, &dport);
++	if (!parent_port) {
++		dev_err(dev, "CXL port topology not found\n");
++		return -ENXIO;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 2cccce49e3b4..e79ec29d0bb6 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -844,6 +844,45 @@ static void cxl_debugfs_create_dport_dir(struct cxl_dport *dport)
+ 			    &cxl_einj_inject_fops);
+ }
+ 
++static bool is_cxl_ep_device(struct device *dev)
++{
++	return is_cxl_memdev(dev) || is_cxl_cachedev(dev);
++}
++
++static int cxl_port_setup_endpoint(struct cxl_port *port)
++{
++	struct device *uport_dev = port->uport_dev;
++	struct cxl_dev_state *cxlds;
++	struct cxl_cachedev *cxlcd;
++	struct cxl_memdev *cxlmd;
++	int rc;
++
++	rc = dev_set_name(&port->dev, "endpoint%d", port->id);
++	if (rc)
++		return rc;
++
++	/*
++	 * The endpoint driver already enumerated the component and RAS
++	 * registers. Reuse that enumeration while prepping them to be
++	 * mapped by the cxl_port driver.
++	 */
++	if (is_cxl_memdev(uport_dev)) {
++		cxlmd = to_cxl_memdev(uport_dev);
++		cxlds = cxlmd->cxlds;
++
++		cxlmd->endpoint = port;
++	} else {
++		cxlcd = to_cxl_cachedev(uport_dev);
++		cxlds = cxlcd->cxlds;
++
++		cxlcd->endpoint = port;
++	}
++
++	port->reg_map = cxlds->reg_map;
++	port->reg_map.host = &port->dev;
++	return 0;
++}
++
+ static int cxl_port_add(struct cxl_port *port,
+ 			resource_size_t component_reg_phys,
+ 			struct cxl_dport *parent_dport)
+@@ -851,22 +890,10 @@ static int cxl_port_add(struct cxl_port *port,
+ 	struct device *dev __free(put_device) = &port->dev;
+ 	int rc;
+ 
+-	if (is_cxl_memdev(port->uport_dev)) {
+-		struct cxl_memdev *cxlmd = to_cxl_memdev(port->uport_dev);
+-		struct cxl_dev_state *cxlds = cxlmd->cxlds;
+-
+-		rc = dev_set_name(dev, "endpoint%d", port->id);
++	if (is_cxl_ep_device(port->uport_dev)) {
++		rc = cxl_port_setup_endpoint(port);
+ 		if (rc)
+ 			return rc;
+-
+-		/*
+-		 * The endpoint driver already enumerated the component and RAS
+-		 * registers. Reuse that enumeration while prepping them to be
+-		 * mapped by the cxl_port driver.
+-		 */
+-		port->reg_map = cxlds->reg_map;
+-		port->reg_map.host = &port->dev;
+-		cxlmd->endpoint = port;
+ 	} else if (parent_dport) {
+ 		rc = dev_set_name(dev, "port%d", port->id);
+ 		if (rc)
+@@ -1603,7 +1630,8 @@ static int update_decoder_targets(struct device *dev, void *data)
+ 
+ DEFINE_FREE(del_cxl_dport, struct cxl_dport *, if (!IS_ERR_OR_NULL(_T)) del_dport(_T))
+ static struct cxl_dport *cxl_port_add_dport(struct cxl_port *port,
+-					    struct device *dport_dev)
++					    struct device *dport_dev,
++					    struct device *ep_dev)
+ {
+ 	struct cxl_dport *dport;
+ 	int rc;
+@@ -1624,6 +1652,10 @@ static struct cxl_dport *cxl_port_add_dport(struct cxl_port *port,
+ 	if (IS_ERR(new_dport))
+ 		return new_dport;
+ 
++	/* CXL.cache devices aren't expected to have HDM decoders */
++	if (ep_dev && is_cxl_cachedev(ep_dev))
++		return no_free_ptr(new_dport);
++
+ 	cxl_switch_parse_cdat(new_dport);
+ 
+ 	if (ida_is_empty(&port->decoder_ida)) {
+@@ -1655,9 +1687,10 @@ static struct cxl_dport *devm_cxl_create_port(struct device *ep_dev,
+ 	device_lock_assert(&parent_port->dev);
+ 	if (!parent_port->dev.driver) {
+ 		dev_warn(ep_dev,
+-			 "port %s:%s:%s disabled, failed to enumerate CXL.mem\n",
++			 "port %s:%s:%s disabled, failed to enumerate CXL.%s\n",
+ 			 dev_name(&parent_port->dev), dev_name(uport_dev),
+-			 dev_name(dport_dev));
++			 dev_name(dport_dev),
++			 is_cxl_memdev(ep_dev) ? "mem" : "cache");
+ 	}
+ 
+ 	struct cxl_port *port __free(put_cxl_port) =
+@@ -1688,10 +1721,10 @@ static struct cxl_dport *devm_cxl_create_port(struct device *ep_dev,
+ 	}
+ 
+ 	guard(device)(&port->dev);
+-	return cxl_port_add_dport(port, dport_dev);
++	return cxl_port_add_dport(port, dport_dev, ep_dev);
+ }
+ 
+-static int add_port_attach_ep(struct cxl_memdev *cxlmd,
++static int add_port_attach_ep(struct device *ep_dev,
+ 			      struct device *uport_dev,
+ 			      struct device *dport_dev)
+ {
+@@ -1705,8 +1738,7 @@ static int add_port_attach_ep(struct cxl_memdev *cxlmd,
+ 		 * CXL-root 'cxl_port' on a previous iteration, fail for now to
+ 		 * be re-probed after platform driver attaches.
+ 		 */
+-		dev_dbg(&cxlmd->dev, "%s is a root dport\n",
+-			dev_name(dport_dev));
++		dev_dbg(ep_dev, "%s is a root dport\n", dev_name(dport_dev));
+ 		return -ENXIO;
+ 	}
+ 
+@@ -1720,12 +1752,13 @@ static int add_port_attach_ep(struct cxl_memdev *cxlmd,
+ 	scoped_guard(device, &parent_port->dev) {
+ 		parent_dport = cxl_find_dport_by_dev(parent_port, dparent);
+ 		if (!parent_dport) {
+-			parent_dport = cxl_port_add_dport(parent_port, dparent);
++			parent_dport = cxl_port_add_dport(parent_port, dparent,
++							  ep_dev);
+ 			if (IS_ERR(parent_dport))
+ 				return PTR_ERR(parent_dport);
+ 		}
+ 
+-		dport = devm_cxl_create_port(&cxlmd->dev, parent_port,
++		dport = devm_cxl_create_port(ep_dev, parent_port,
+ 					     parent_dport, uport_dev,
+ 					     dport_dev);
+ 		if (IS_ERR(dport)) {
+@@ -1736,7 +1769,7 @@ static int add_port_attach_ep(struct cxl_memdev *cxlmd,
+ 		}
+ 	}
+ 
+-	rc = cxl_add_ep(dport, &cxlmd->dev);
++	rc = cxl_add_ep(dport, ep_dev);
+ 	if (rc == -EBUSY) {
+ 		/*
+ 		 * "can't" happen, but this error code means
+@@ -1756,7 +1789,7 @@ static struct cxl_dport *find_or_add_dport(struct cxl_port *port,
+ 	device_lock_assert(&port->dev);
+ 	dport = cxl_find_dport_by_dev(port, dport_dev);
+ 	if (!dport) {
+-		dport = cxl_port_add_dport(port, dport_dev);
++		dport = cxl_port_add_dport(port, dport_dev, NULL);
+ 		if (IS_ERR(dport))
+ 			return dport;
+ 
+@@ -1767,9 +1800,8 @@ static struct cxl_dport *find_or_add_dport(struct cxl_port *port,
+ 	return dport;
+ }
+ 
+-int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
++int devm_cxl_enumerate_ports(struct device *ep_dev, struct cxl_dev_state *cxlds)
+ {
+-	struct device *dev = &cxlmd->dev;
+ 	struct device *iter;
+ 	int rc;
+ 
+@@ -1777,12 +1809,15 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ 	 * Skip intermediate port enumeration in the RCH case, there
+ 	 * are no ports in between a host bridge and an endpoint.
+ 	 */
+-	if (cxlmd->cxlds->rcd)
++	if (cxlds->rcd)
+ 		return 0;
+ 
+-	rc = devm_add_action_or_reset(&cxlmd->dev, cxl_detach_ep, cxlmd);
+-	if (rc)
+-		return rc;
++	if (is_cxl_memdev(ep_dev)) {
++		rc = devm_add_action_or_reset(ep_dev, cxl_detach_ep,
++					      to_cxl_memdev(ep_dev));
++		if (rc)
++			return rc;
++	}
+ 
+ 	/*
+ 	 * Scan for and add all cxl_ports in this device's ancestry.
+@@ -1790,7 +1825,7 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ 	 * attempt fails.
+ 	 */
+ retry:
+-	for (iter = dev; iter; iter = grandparent(iter)) {
++	for (iter = ep_dev; iter; iter = grandparent(iter)) {
+ 		struct device *dport_dev = grandparent(iter);
+ 		struct device *uport_dev;
+ 		struct cxl_dport *dport;
+@@ -1800,18 +1835,18 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ 
+ 		uport_dev = dport_dev->parent;
+ 		if (!uport_dev) {
+-			dev_warn(dev, "at %s no parent for dport: %s\n",
++			dev_warn(ep_dev, "at %s no parent for dport: %s\n",
+ 				 dev_name(iter), dev_name(dport_dev));
+ 			return -ENXIO;
+ 		}
+ 
+-		dev_dbg(dev, "scan: iter: %s dport_dev: %s parent: %s\n",
++		dev_dbg(ep_dev, "scan: iter: %s dport_dev: %s parent: %s\n",
+ 			dev_name(iter), dev_name(dport_dev),
+ 			dev_name(uport_dev));
+ 		struct cxl_port *port __free(put_cxl_port) =
+ 			find_cxl_port_by_uport(uport_dev);
+ 		if (port) {
+-			dev_dbg(&cxlmd->dev,
++			dev_dbg(ep_dev,
+ 				"found already registered port %s:%s\n",
+ 				dev_name(&port->dev),
+ 				dev_name(port->uport_dev));
+@@ -1829,7 +1864,7 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ 				}
+ 			}
+ 
+-			rc = cxl_add_ep(dport, &cxlmd->dev);
++			rc = cxl_add_ep(dport, ep_dev);
+ 
+ 			/*
+ 			 * If the endpoint already exists in the port's list,
+@@ -1850,7 +1885,7 @@ int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd)
+ 			return 0;
+ 		}
+ 
+-		rc = add_port_attach_ep(cxlmd, uport_dev, dport_dev);
++		rc = add_port_attach_ep(ep_dev, uport_dev, dport_dev);
+ 		/* port missing, try to add parent */
+ 		if (rc == -EAGAIN)
+ 			continue;
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 5ef0fb71af91..6c7b8278bec3 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -885,7 +885,8 @@ DEFINE_FREE(put_cxl_port, struct cxl_port *, if (!IS_ERR_OR_NULL(_T)) put_device
+ DEFINE_FREE(put_cxl_root_decoder, struct cxl_root_decoder *, if (!IS_ERR_OR_NULL(_T)) put_device(&_T->cxlsd.cxld.dev))
+ DEFINE_FREE(put_cxl_region, struct cxl_region *, if (!IS_ERR_OR_NULL(_T)) put_device(&_T->dev))
+ 
+-int devm_cxl_enumerate_ports(struct cxl_memdev *cxlmd);
++int devm_cxl_enumerate_ports(struct device *ep_dev,
++			     struct cxl_dev_state *cxlds);
+ void cxl_bus_rescan(void);
+ void cxl_bus_drain(void);
+ struct cxl_port *cxl_pci_find_port(struct pci_dev *pdev,
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index d12c96b68c82..3b230f8c5925 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -104,7 +104,7 @@ static int cxl_mem_probe(struct device *dev)
+ 	if (rc)
+ 		return rc;
+ 
+-	rc = devm_cxl_enumerate_ports(cxlmd);
++	rc = devm_cxl_enumerate_ports(dev, cxlds);
+ 	if (rc)
+ 		return rc;
+ 
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index c2fbdbfe0b6b..efea9b04b323 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -74,6 +74,9 @@ static int cxl_endpoint_port_probe(struct cxl_port *port)
+ 	struct cxl_memdev *cxlmd = to_cxl_memdev(port->uport_dev);
+ 	int rc;
+ 
++	if (!is_cxl_memdev(port->uport_dev))
++		return -EOPNOTSUPP;
++
+ 	/* Cache the data early to ensure is_visible() works */
+ 	read_cdat_data(port);
+ 	cxl_endpoint_parse_cdat(port);
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 9/17] cxl/port: Split endpoint port probe on device type
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:24 -0600
+Message-Id: <20251111214032.8188-10-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+CXL.cache endpoints have separate set up requirements than CXL.mem
+endpoints. Split cxl_endpoint_port_probe() into functions for CXL.mem
+endpoints and CXL.cache endpoints.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/port.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index efea9b04b323..14319219d23b 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -69,19 +69,15 @@ static int cxl_switch_port_probe(struct cxl_port *port)
+ 	return 0;
+ }
+ 
+-static int cxl_endpoint_port_probe(struct cxl_port *port)
++static int cxl_mem_endpoint_port_probe(struct cxl_port *port)
+ {
+ 	struct cxl_memdev *cxlmd = to_cxl_memdev(port->uport_dev);
+ 	int rc;
+ 
+-	if (!is_cxl_memdev(port->uport_dev))
+-		return -EOPNOTSUPP;
+-
+ 	/* Cache the data early to ensure is_visible() works */
+ 	read_cdat_data(port);
+ 	cxl_endpoint_parse_cdat(port);
+ 
+-	get_device(&cxlmd->dev);
+ 	rc = devm_add_action_or_reset(&port->dev, schedule_detach, cxlmd);
+ 	if (rc)
+ 		return rc;
+@@ -99,6 +95,23 @@ static int cxl_endpoint_port_probe(struct cxl_port *port)
+ 	return 0;
+ }
+ 
++static int cxl_cache_endpoint_port_probe(struct cxl_port *port)
++{
++	/* No further set up required for CXL.cache devices */
++	return 0;
++}
++
++static int cxl_endpoint_port_probe(struct cxl_port *port)
++{
++	struct device *ep_dev = port->uport_dev;
++
++	get_device(ep_dev);
++	if (is_cxl_memdev(ep_dev))
++		return cxl_mem_endpoint_port_probe(port);
++	else
++		return cxl_cache_endpoint_port_probe(port);
++}
++
+ static int cxl_port_probe(struct device *dev)
+ {
+ 	struct cxl_port *port = to_cxl_port(dev);
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 10/17] cxl/cache, mem: Prevent RAS register mapping race
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:25 -0600
+Message-Id: <20251111214032.8188-11-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+CXL type 2 devices will register both a struct cxl_memdev and struct
+cxl_cachedev, both of which will attempt to map the parent dport's RAS
+registers in cxl_dport_init_ras_reporting(). While the immediate call
+fails gracefully, an error is emitted in the dmesg log by
+cxl_map_component_regs().
+
+Avoid this error message by checking if the RAS registers are already
+mapped while the port's device lock is held.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/cache.c | 11 +++++++++++
+ drivers/cxl/mem.c   |  5 +++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/cxl/cache.c b/drivers/cxl/cache.c
+index 630452d53acc..4c9280c0ea72 100644
+--- a/drivers/cxl/cache.c
++++ b/drivers/cxl/cache.c
+@@ -58,6 +58,7 @@ static int cxl_cache_probe(struct device *dev)
+ {
+ 	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
+ 	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	struct device *endpoint_parent;
+ 	struct cxl_dport *dport;
+ 	int rc;
+ 
+@@ -72,6 +73,16 @@ static int cxl_cache_probe(struct device *dev)
+ 		return -ENXIO;
+ 	}
+ 
++	if (dport->rch)
++		endpoint_parent = parent_port->uport_dev;
++	else
++		endpoint_parent = &parent_port->dev;
++
++	scoped_guard(device, endpoint_parent) {
++		if (!cxlds->cxlmd)
++			cxl_dport_init_ras_reporting(dport, dev);
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index 3b230f8c5925..35706ec1b7e1 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -129,9 +129,10 @@ static int cxl_mem_probe(struct device *dev)
+ 	else
+ 		endpoint_parent = &parent_port->dev;
+ 
+-	cxl_dport_init_ras_reporting(dport, dev);
+-
+ 	scoped_guard(device, endpoint_parent) {
++		if (!cxlds->cxlcd)
++			cxl_dport_init_ras_reporting(dport, dev);
++
+ 		if (!endpoint_parent->driver) {
+ 			dev_err(dev, "CXL port topology %s not enabled\n",
+ 				dev_name(endpoint_parent));
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 11/17] cxl/core, port: Update devm_cxl_add_endpoint()
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:26 -0600
+Message-Id: <20251111214032.8188-12-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Update devm_cxl_add_endpoint(), and other functions it calls, to use
+struct device instead of struct cxl_memdev to allow adding struct
+cxl_cachedev endpoints to the port heirarchy.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/cache.c     | 10 ++++++++++
+ drivers/cxl/core/port.c | 37 +++++++++++++++++++++++++++++--------
+ drivers/cxl/cxl.h       |  3 ++-
+ drivers/cxl/mem.c       |  2 +-
+ drivers/cxl/port.c      | 13 ++++++++-----
+ drivers/cxl/private.h   |  2 +-
+ 6 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/cxl/cache.c b/drivers/cxl/cache.c
+index 4c9280c0ea72..dcc9816d9b37 100644
+--- a/drivers/cxl/cache.c
++++ b/drivers/cxl/cache.c
+@@ -81,6 +81,16 @@ static int cxl_cache_probe(struct device *dev)
+ 	scoped_guard(device, endpoint_parent) {
+ 		if (!cxlds->cxlmd)
+ 			cxl_dport_init_ras_reporting(dport, dev);
++
++		if (!endpoint_parent->driver) {
++			dev_err(dev, "CXL port topology %s not enabled\n",
++				dev_name(endpoint_parent));
++			return -ENXIO;
++		}
++
++		rc = devm_cxl_add_endpoint(endpoint_parent, dev, dport);
++		if (rc)
++			return rc;
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index e79ec29d0bb6..dc001e136782 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -844,10 +844,11 @@ static void cxl_debugfs_create_dport_dir(struct cxl_dport *dport)
+ 			    &cxl_einj_inject_fops);
+ }
+ 
+-static bool is_cxl_ep_device(struct device *dev)
++bool is_cxl_ep_device(struct device *dev)
+ {
+ 	return is_cxl_memdev(dev) || is_cxl_cachedev(dev);
+ }
++EXPORT_SYMBOL_NS_GPL(is_cxl_ep_device, "CXL");
+ 
+ static int cxl_port_setup_endpoint(struct cxl_port *port)
+ {
+@@ -1424,10 +1425,26 @@ static struct device *endpoint_host(struct cxl_port *endpoint)
+ 	return &port->dev;
+ }
+ 
++static void cxl_ep_dev_set_endpoint(struct device *ep_dev, struct cxl_port *ep)
++{
++	if (is_cxl_memdev(ep_dev))
++		to_cxl_memdev(ep_dev)->endpoint = ep;
++	else
++		to_cxl_cachedev(ep_dev)->endpoint = ep;
++}
++
++static struct cxl_port *cxl_ep_dev_get_endpoint(struct device *ep_dev)
++{
++	if (is_cxl_memdev(ep_dev))
++		return to_cxl_memdev(ep_dev)->endpoint;
++	else
++		return to_cxl_cachedev(ep_dev)->endpoint;
++}
++
+ static void delete_endpoint(void *data)
+ {
+-	struct cxl_memdev *cxlmd = data;
+-	struct cxl_port *endpoint = cxlmd->endpoint;
++	struct device *ep_dev = data;
++	struct cxl_port *endpoint = cxl_ep_dev_get_endpoint(ep_dev);
+ 	struct device *host = endpoint_host(endpoint);
+ 
+ 	scoped_guard(device, host) {
+@@ -1436,21 +1453,25 @@ static void delete_endpoint(void *data)
+ 			devm_release_action(host, cxl_unlink_uport, endpoint);
+ 			devm_release_action(host, unregister_port, endpoint);
+ 		}
+-		cxlmd->endpoint = NULL;
++		cxl_ep_dev_set_endpoint(ep_dev, NULL);
+ 	}
+ 	put_device(&endpoint->dev);
+ 	put_device(host);
+ }
+ 
+-int cxl_endpoint_autoremove(struct cxl_memdev *cxlmd, struct cxl_port *endpoint)
++int cxl_endpoint_autoremove(struct device *ep_dev, struct cxl_port *endpoint)
+ {
+ 	struct device *host = endpoint_host(endpoint);
+-	struct device *dev = &cxlmd->dev;
+ 
+ 	get_device(host);
+ 	get_device(&endpoint->dev);
+-	cxlmd->depth = endpoint->depth;
+-	return devm_add_action_or_reset(dev, delete_endpoint, cxlmd);
++
++	if (is_cxl_memdev(ep_dev))
++		to_cxl_memdev(ep_dev)->depth = endpoint->depth;
++	else
++		to_cxl_cachedev(ep_dev)->depth = endpoint->depth;
++
++	return devm_add_action_or_reset(ep_dev, delete_endpoint, ep_dev);
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_endpoint_autoremove, "CXL");
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index 6c7b8278bec3..e8d66de469d6 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -917,6 +917,7 @@ struct cxl_endpoint_decoder *to_cxl_endpoint_decoder(struct device *dev);
+ bool is_root_decoder(struct device *dev);
+ bool is_switch_decoder(struct device *dev);
+ bool is_endpoint_decoder(struct device *dev);
++bool is_cxl_ep_device(struct device *dev);
+ struct cxl_root_decoder *cxl_root_decoder_alloc(struct cxl_port *port,
+ 						unsigned int nr_targets);
+ struct cxl_switch_decoder *cxl_switch_decoder_alloc(struct cxl_port *port,
+@@ -930,7 +931,7 @@ static inline int cxl_root_decoder_autoremove(struct device *host,
+ {
+ 	return cxl_decoder_autoremove(host, &cxlrd->cxlsd.cxld);
+ }
+-int cxl_endpoint_autoremove(struct cxl_memdev *cxlmd, struct cxl_port *endpoint);
++int cxl_endpoint_autoremove(struct device *ep_dev, struct cxl_port *endpoint);
+ 
+ /**
+  * struct cxl_endpoint_dvsec_info - Cached DVSEC info
+diff --git a/drivers/cxl/mem.c b/drivers/cxl/mem.c
+index 35706ec1b7e1..336ae091aa07 100644
+--- a/drivers/cxl/mem.c
++++ b/drivers/cxl/mem.c
+@@ -139,7 +139,7 @@ static int cxl_mem_probe(struct device *dev)
+ 			return -ENXIO;
+ 		}
+ 
+-		rc = devm_cxl_add_endpoint(endpoint_parent, cxlmd, dport);
++		rc = devm_cxl_add_endpoint(endpoint_parent, dev, dport);
+ 		if (rc)
+ 			return rc;
+ 	}
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index 14319219d23b..ae38b9965a84 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -178,13 +178,16 @@ static struct cxl_driver cxl_port_driver = {
+ 	},
+ };
+ 
+-int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
++int devm_cxl_add_endpoint(struct device *host, struct device *ep_dev,
+ 			  struct cxl_dport *parent_dport)
+ {
+ 	struct cxl_port *parent_port = parent_dport->port;
+ 	struct cxl_port *endpoint, *iter, *down;
+ 	int rc;
+ 
++	if (!is_cxl_ep_device(ep_dev))
++		return -EINVAL;
++
+ 	/*
+ 	 * Now that the path to the root is established record all the
+ 	 * intervening ports in the chain.
+@@ -193,22 +196,22 @@ int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
+ 	     down = iter, iter = to_cxl_port(iter->dev.parent)) {
+ 		struct cxl_ep *ep;
+ 
+-		ep = cxl_ep_load(iter, &cxlmd->dev);
++		ep = cxl_ep_load(iter, ep_dev);
+ 		ep->next = down;
+ 	}
+ 
+ 	/* Note: endpoint port component registers are derived from @cxlds */
+-	endpoint = devm_cxl_add_port(host, &cxlmd->dev, CXL_RESOURCE_NONE,
++	endpoint = devm_cxl_add_port(host, ep_dev, CXL_RESOURCE_NONE,
+ 				     parent_dport);
+ 	if (IS_ERR(endpoint))
+ 		return PTR_ERR(endpoint);
+ 
+-	rc = cxl_endpoint_autoremove(cxlmd, endpoint);
++	rc = cxl_endpoint_autoremove(ep_dev, endpoint);
+ 	if (rc)
+ 		return rc;
+ 
+ 	if (!endpoint->dev.driver) {
+-		dev_err(&cxlmd->dev, "%s failed probe\n",
++		dev_err(ep_dev, "%s failed probe\n",
+ 			dev_name(&endpoint->dev));
+ 		return -ENXIO;
+ 	}
+diff --git a/drivers/cxl/private.h b/drivers/cxl/private.h
+index 25e6bce2457f..96832ab594d8 100644
+--- a/drivers/cxl/private.h
++++ b/drivers/cxl/private.h
+@@ -10,7 +10,7 @@
+ 
+ #ifndef __CXL_PRIVATE_H__
+ #define __CXL_PRIVATE_H__
+-int devm_cxl_add_endpoint(struct device *host, struct cxl_memdev *cxlmd,
++int devm_cxl_add_endpoint(struct device *host, struct device *ep_dev,
+ 			  struct cxl_dport *parent_dport);
+ 
+ struct cxl_cachedev *cxl_cachedev_alloc(struct cxl_dev_state *cxlds);
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 12/17] cxl/core: Add CXL snoop filter setup and allocation
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:27 -0600
+Message-Id: <20251111214032.8188-13-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+The CXL snoop filter capability (CXL 3.2 8.2.4.23) is a mandatory
+capability for CXL 2.0+ root ports that is used by the host and CXL
+devices to manage CXL cache coherence.
+
+Snoop filters may be shared by several CXL root ports, with each snoop
+filter having a unique group id. Create snoop filter instances as CXL
+root ports are added to the system. If the snoop filter already exists,
+add the root port to the existing filter instead.
+
+Snoop filter instances are used to keep track of the amount of CXL cache
+space active under the filter. The CXL specification allows rejecting
+CXL devices based on the amount of filter subscription, but determining
+when the filter is oversaturated is most likely implementation specific.
+To address this, add a cxl_core module parameter to specify whether
+adding a CXL.cache device's cache to an already full filter should fail
+device probe. The default setting of the parameter is to allow
+oversaturation of the filter ("strict_snoop=off").
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+Jonathan asked about the allocation policy when the snoop filter is
+"full". I had the device fail probe beforehand, but it got me thinking
+that it may be worthwhile to add an option to over commit the filter
+instead, hence the module parameter. I'm game to other suggestions, but
+a config symbol didn't feel right since the setting probably varies by
+platform/user.
+
+Also I'll add Cache_SF_Coverage support when this series goes out of
+RFC (I forgot to do it this time around).
+
+---
+ drivers/cxl/cache.c     |  35 ++++++++
+ drivers/cxl/core/port.c | 178 ++++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/core/regs.c |   7 ++
+ drivers/cxl/cxl.h       |  14 ++++
+ 4 files changed, 234 insertions(+)
+
+diff --git a/drivers/cxl/cache.c b/drivers/cxl/cache.c
+index dcc9816d9b37..40c3ffd9c89b 100644
+--- a/drivers/cxl/cache.c
++++ b/drivers/cxl/cache.c
+@@ -12,6 +12,10 @@
+  * device-specific driver is required for discovery and portions of set up.
+  */
+ 
++/* Controls whether failing to allocate snoop filter capacity is tolerated */
++static bool strict_snoop;
++module_param(strict_snoop, bool, 0644);
++
+ /**
+  * devm_cxl_add_cachedev - Add a CXL cache device
+  * @host: devres alloc/release context and parent for the cachedev
+@@ -54,6 +58,22 @@ struct cxl_cachedev *devm_cxl_add_cachedev(struct device *host,
+ }
+ EXPORT_SYMBOL_NS_GPL(devm_cxl_add_cachedev, "CXL");
+ 
++static int cxl_populate_snoop_gid(struct cxl_cachedev *cxlcd)
++{
++	struct cxl_cache_state *cstate = &cxlcd->cxlds->cstate;
++
++	for (struct cxl_dport *iter = cxlcd->endpoint->parent_dport;
++	     iter && !is_cxl_root(iter->port);
++	     iter = iter->port->parent_dport) {
++		if (iter->snoop_id != CXL_SNOOP_ID_NO_ID) {
++			cstate->snoop_id = iter->snoop_id;
++			return 0;
++		}
++	}
++
++	return -ENXIO;
++}
++
+ static int cxl_cache_probe(struct device *dev)
+ {
+ 	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
+@@ -93,6 +113,21 @@ static int cxl_cache_probe(struct device *dev)
+ 			return rc;
+ 	}
+ 
++	rc = cxl_populate_snoop_gid(cxlcd);
++	if (rc) {
++		dev_dbg(&cxlcd->dev, "failed to get snoop id: %d\n", rc);
++		return rc;
++	}
++
++	rc = devm_cxl_snoop_filter_alloc_capacity(cxlcd);
++	if (rc) {
++		dev_dbg(&cxlcd->dev,
++			"failed to allocate snoop filter capacity: %d\n", rc);
++
++		if (strict_snoop)
++			return rc;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index dc001e136782..70666a059d1f 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -34,6 +34,8 @@
+ static DEFINE_IDA(cxl_port_ida);
+ static DEFINE_XARRAY(cxl_root_buses);
+ 
++static DEFINE_XARRAY(cxl_snoop_filters);
++
+ /*
+  * The terminal device in PCI is NULL and @platform_bus
+  * for platform devices (for cxl_test)
+@@ -810,6 +812,175 @@ static int cxl_dport_setup_regs(struct device *host, struct cxl_dport *dport,
+ 	return rc;
+ }
+ 
++struct cxl_snoop_filter {
++	u64 size;
++	struct xarray dports;
++	struct xarray devs;
++	struct mutex lock; /* Used for filter allocations */
++};
++
++static int cxl_snoop_filter_add_dport(struct cxl_dport *dport, u32 gid)
++{
++	struct cxl_snoop_filter *sf;
++
++	sf = xa_load(&cxl_snoop_filters, gid);
++	if (sf)
++		return xa_insert(&sf->dports, (unsigned long)dport->dport_dev,
++				 dport, GFP_KERNEL);
++
++	return -ENXIO;
++}
++
++static struct cxl_snoop_filter *cxl_alloc_snoop_filter(u64 size)
++{
++	struct cxl_snoop_filter *sf;
++
++	sf = kzalloc(sizeof(*sf), GFP_KERNEL);
++	if (!sf)
++		return NULL;
++
++	sf->size = size;
++	xa_init(&sf->dports);
++	xa_init(&sf->devs);
++	mutex_init(&sf->lock);
++
++	return sf;
++}
++
++static void cxl_destroy_snoop_filter(struct cxl_snoop_filter *sf)
++{
++	xa_destroy(&sf->dports);
++	xa_destroy(&sf->devs);
++	mutex_destroy(&sf->lock);
++	kfree(sf);
++}
++
++static int cxl_create_snoop_filter(struct cxl_dport *dport, u32 gid, u64 size)
++{
++	struct cxl_snoop_filter *sf;
++	int rc;
++
++	sf = cxl_alloc_snoop_filter(size);
++	if (!sf)
++		return -ENOMEM;
++
++	rc = xa_insert(&sf->dports, (unsigned long)dport->dport_dev, dport,
++		       GFP_KERNEL);
++	if (rc) {
++		cxl_destroy_snoop_filter(sf);
++		return rc;
++	}
++
++	rc = xa_insert(&cxl_snoop_filters, gid, sf, GFP_KERNEL);
++	if (rc) {
++		cxl_destroy_snoop_filter(sf);
++
++		/*
++		 * The snoop filter insert failed due to a race, get the already
++		 * made snoop filter.
++		 */
++		if (rc == -EBUSY)
++			return cxl_snoop_filter_add_dport(dport, gid);
++
++		return rc;
++	}
++
++	return 0;
++}
++
++static void cxl_snoop_filter_free_capacity(void *data)
++{
++	struct cxl_cache_state *cstate = data;
++	struct cxl_snoop_filter *sf;
++
++	sf = xa_load(&cxl_snoop_filters, cstate->snoop_id);
++	if (!sf) {
++		pr_debug("failed to find snoop filter with id %d\n",
++			 cstate->snoop_id);
++		return;
++	}
++
++	guard(mutex)(&sf->lock);
++	sf->size += cstate->size;
++}
++
++/**
++ * devm_cxl_snoop_filter_alloc_capacity - Reserve snoop filter capacity for a
++ * CXL.cache device's cache.
++ * @cxlcd: Device to allocate capacity for
++ */
++int devm_cxl_snoop_filter_alloc_capacity(struct cxl_cachedev *cxlcd)
++{
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	struct cxl_cache_state *cstate = &cxlds->cstate;
++	struct cxl_snoop_filter *sf;
++	int gid = cstate->snoop_id;
++
++	sf = xa_load(&cxl_snoop_filters, gid);
++	if (!sf)
++		return -ENODEV;
++
++	guard(mutex)(&sf->lock);
++	if (cstate->size > sf->size)
++		return -EBUSY;
++
++	sf->size -= cstate->size;
++	return devm_add_action_or_reset(&cxlcd->dev,
++					cxl_snoop_filter_free_capacity, cstate);
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_snoop_filter_alloc_capacity, "CXL");
++
++static void cxl_destroy_snoop_filters(void)
++{
++	struct cxl_snoop_filter *sf;
++	unsigned long gid;
++
++	xa_for_each(&cxl_snoop_filters, gid, sf)
++		cxl_destroy_snoop_filter(sf);
++
++	xa_destroy(&cxl_snoop_filters);
++}
++
++static int cxl_dport_setup_snoop_filter(struct cxl_dport *dport)
++{
++	struct cxl_port *port = dport->port;
++	struct cxl_port *parent_port;
++	u32 snoop, size;
++	int gid, rc;
++
++	/* Capability is only support by CXL root ports */
++	parent_port = parent_port_of(port);
++	if (!parent_port || !is_cxl_root(parent_port))
++		return 0;
++
++	if (!dport->reg_map.component_map.snoop.valid) {
++		dev_dbg(dport->dport_dev, "missing snoop filter capability\n");
++		return -ENXIO;
++	}
++
++	rc = cxl_map_component_regs(&dport->reg_map, &dport->regs.component,
++				    BIT(CXL_CM_CAP_CAP_ID_SNOOP));
++	if (rc)
++		return rc;
++
++	snoop = readl(dport->regs.snoop + CXL_SNOOP_GROUP_ID_OFFSET);
++	gid = FIELD_GET(CXL_SNOOP_GROUP_ID_MASK, snoop);
++
++	size = readl(dport->regs.snoop + CXL_SNOOP_FILTER_SIZE_OFFSET);
++	if (!size)
++		dev_warn(dport->dport_dev, "CXL snoop filter has no capacity\n");
++
++	rc = cxl_snoop_filter_add_dport(dport, gid);
++	if (rc) {
++		rc = cxl_create_snoop_filter(dport, gid, size);
++		if (rc)
++			return rc;
++	}
++
++	dport->snoop_id = gid;
++	return 0;
++}
++
+ DEFINE_SHOW_ATTRIBUTE(einj_cxl_available_error_type);
+ 
+ static int cxl_einj_inject(void *data, u64 type)
+@@ -1177,6 +1348,7 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
+ 	dport->dport_dev = dport_dev;
+ 	dport->port_id = port_id;
+ 	dport->port = port;
++	dport->snoop_id = CXL_SNOOP_ID_NO_ID;
+ 
+ 	if (rcrb == CXL_RESOURCE_NONE) {
+ 		rc = cxl_dport_setup_regs(&port->dev, dport,
+@@ -1207,6 +1379,11 @@ __devm_cxl_add_dport(struct cxl_port *port, struct device *dport_dev,
+ 		dev_dbg(dport_dev, "Component Registers found for dport: %pa\n",
+ 			&component_reg_phys);
+ 
++	rc = cxl_dport_setup_snoop_filter(dport);
++	if (rc)
++		dev_dbg(dport->dport_dev,
++			"failed to set up snoop filter capability %d\n", rc);
++
+ 	cond_cxl_root_lock(port);
+ 	rc = add_dport(port, dport);
+ 	cond_cxl_root_unlock(port);
+@@ -2585,6 +2762,7 @@ static void cxl_core_exit(void)
+ 	bus_unregister(&cxl_bus_type);
+ 	destroy_workqueue(cxl_bus_wq);
+ 	cxl_memdev_exit();
++	cxl_destroy_snoop_filters();
+ 	debugfs_remove_recursive(cxl_debugfs);
+ }
+ 
+diff --git a/drivers/cxl/core/regs.c b/drivers/cxl/core/regs.c
+index 5ca7b0eed568..280978b34d2f 100644
+--- a/drivers/cxl/core/regs.c
++++ b/drivers/cxl/core/regs.c
+@@ -92,6 +92,12 @@ void cxl_probe_component_regs(struct device *dev, void __iomem *base,
+ 			length = CXL_RAS_CAPABILITY_LENGTH;
+ 			rmap = &map->ras;
+ 			break;
++		case CXL_CM_CAP_CAP_ID_SNOOP:
++			dev_dbg(dev, "found Snoop Filter capability (0x%x)\n",
++				offset);
++			length = CXL_SNOOP_CAPABILITY_LENGTH;
++			rmap = &map->snoop;
++			break;
+ 		default:
+ 			dev_dbg(dev, "Unknown CM cap ID: %d (0x%x)\n", cap_id,
+ 				offset);
+@@ -211,6 +217,7 @@ int cxl_map_component_regs(const struct cxl_register_map *map,
+ 	} mapinfo[] = {
+ 		{ &map->component_map.hdm_decoder, &regs->hdm_decoder },
+ 		{ &map->component_map.ras, &regs->ras },
++		{ &map->component_map.snoop, &regs->snoop },
+ 	};
+ 	int i;
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index e8d66de469d6..de29ffc3d74f 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -41,6 +41,7 @@ extern const struct nvdimm_security_ops *cxl_security_ops;
+ 
+ #define   CXL_CM_CAP_CAP_ID_RAS 0x2
+ #define   CXL_CM_CAP_CAP_ID_HDM 0x5
++#define   CXL_CM_CAP_CAP_ID_SNOOP 0x8
+ #define   CXL_CM_CAP_CAP_HDM_VERSION 1
+ 
+ /* HDM decoders CXL 2.0 8.2.5.12 CXL HDM Decoder Capability Structure */
+@@ -152,6 +153,12 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define CXL_HEADERLOG_SIZE SZ_512
+ #define CXL_HEADERLOG_SIZE_U32 SZ_512 / sizeof(u32)
+ 
++/* CXL 3.2 8.2.4.23 CXL Snoop Filter Capability Structure */
++#define CXL_SNOOP_GROUP_ID_OFFSET 0x0
++#define   CXL_SNOOP_GROUP_ID_MASK GENMASK(15, 0)
++#define CXL_SNOOP_FILTER_SIZE_OFFSET 0x4
++#define CXL_SNOOP_CAPABILITY_LENGTH 0x8
++
+ /* CXL 2.0 8.2.8.1 Device Capabilities Array Register */
+ #define CXLDEV_CAP_ARRAY_OFFSET 0x0
+ #define   CXLDEV_CAP_ARRAY_CAP_ID 0
+@@ -215,6 +222,7 @@ struct cxl_regs {
+ 	struct_group_tagged(cxl_component_regs, component,
+ 		void __iomem *hdm_decoder;
+ 		void __iomem *ras;
++		void __iomem *snoop;
+ 	);
+ 	/*
+ 	 * Common set of CXL Device register block base pointers
+@@ -257,6 +265,7 @@ struct cxl_reg_map {
+ struct cxl_component_reg_map {
+ 	struct cxl_reg_map hdm_decoder;
+ 	struct cxl_reg_map ras;
++	struct cxl_reg_map snoop;
+ };
+ 
+ struct cxl_device_reg_map {
+@@ -693,6 +702,7 @@ struct cxl_dport {
+ 	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
+ 	long link_latency;
+ 	int gpf_dvsec;
++	int snoop_id;
+ };
+ 
+ /**
+@@ -759,6 +769,7 @@ struct cxl_dpa_info {
+ 	int nr_partitions;
+ };
+ 
++#define CXL_SNOOP_ID_NO_ID (-1)
+ 
+ /**
+  * struct cxl_cache_state - State of a device's CXL cache
+@@ -768,6 +779,7 @@ struct cxl_dpa_info {
+ struct cxl_cache_state {
+ 	u64 size;
+ 	u32 unit;
++	int snoop_id;
+ };
+ 
+ /**
+@@ -832,6 +844,8 @@ static inline struct cxl_dev_state *mbox_to_cxlds(struct cxl_mailbox *cxl_mbox)
+ 	return dev_get_drvdata(cxl_mbox->host);
+ }
+ 
++int devm_cxl_snoop_filter_alloc_capacity(struct cxl_cachedev *cxlcd);
++
+ /**
+  * struct cxl_region_ref - track a region's interest in a port
+  * @port: point in topology to install this reference
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 13/17] cxl/core: Add cache id verification
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:28 -0600
+Message-Id: <20251111214032.8188-14-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+The CXL cache id capability (CXL 3.2 8.2.4.28/29) is an optional
+capability that allows for multiple CXL.cache devices to be enabled
+under a single virtual hierarchy (VH). The cache id capability is
+required for having multiple CXL.cache devices in the same VH.
+
+It's possible for the platform to enable and set up the cache id for a
+CXL.cache device. Add code to cxl_cache to check whether the device's
+cache id is programmed and correct. If it is programmed, allocate the
+cache id to prevent reuse.
+
+Checking the correctness of the id requires knowing if the endpoint
+device is a type 2 device using HDM-D flows. Add a requirement for type
+2 driver to specify if the device is using HDM-D flows before calling
+devm_cxl_add_cachedev().
+
+Programming of cache ids will come in a later commit.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/core/cachedev.c |  20 ++++
+ drivers/cxl/core/pci.c      |   4 +-
+ drivers/cxl/core/port.c     | 229 ++++++++++++++++++++++++++++++++++++
+ drivers/cxl/core/regs.c     |  20 ++++
+ drivers/cxl/cxl.h           |  44 +++++++
+ drivers/cxl/cxlcache.h      |   3 +-
+ drivers/cxl/port.c          |  28 ++++-
+ 7 files changed, 344 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/cxl/core/cachedev.c b/drivers/cxl/core/cachedev.c
+index 5693a63baa9b..0b7430450b4e 100644
+--- a/drivers/cxl/core/cachedev.c
++++ b/drivers/cxl/core/cachedev.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2025 Advanced Micro Devices, Inc. */
+ #include <linux/device.h>
+ #include <linux/pci.h>
++#include "cxlpci.h"
+ 
+ #include "../cxlcache.h"
+ #include "private.h"
+@@ -93,3 +94,22 @@ struct cxl_cachedev *devm_cxl_cachedev_add_or_reset(struct device *host,
+ 	return cxlcd;
+ }
+ EXPORT_SYMBOL_NS_GPL(devm_cxl_cachedev_add_or_reset, "CXL");
++
++bool cxl_cachedev_is_type2(struct cxl_cachedev *cxlcd)
++{
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	int dvsec = cxlds->cxl_dvsec;
++	u32 cap;
++	int rc;
++
++	if (!dev_is_pci(cxlds->dev))
++		return false;
++
++	rc = pci_read_config_dword(to_pci_dev(cxlds->dev),
++				   dvsec + CXL_DVSEC_CAP_OFFSET, &cap);
++	if (rc)
++		return rc;
++
++	return (cap & CXL_DVSEC_MEM_CAPABLE) && (cap & CXL_DVSEC_CACHE_CAPABLE);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_cachedev_is_type2, "CXL");
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 5b1cace8fc0f..27c74e90ade5 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -1264,11 +1264,12 @@ EXPORT_SYMBOL_NS_GPL(cxl_port_get_possible_dports, "CXL");
+ /**
+  * cxl_accel_read_cache_info - Get the CXL cache information of a CXL cache device
+  * @cxlds: CXL device state associated with cache device
++ * @hdmd: Whether the device uses HDM-D flows
+  *
+  * Returns 0 and populates the struct cxl_cache_state member of @cxlds on
+  * success, error otherwise.
+  */
+-int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds)
++int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds, bool hdmd)
+ {
+ 	struct cxl_cache_state *cstate = &cxlds->cstate;
+ 	struct pci_dev *pdev;
+@@ -1308,6 +1309,7 @@ int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds)
+ 	if (!cstate->size)
+ 		return -ENXIO;
+ 
++	cxlds->hdmd = hdmd;
+ 	return 0;
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_accel_read_cache_info, "CXL");
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 70666a059d1f..1504631ae620 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -750,6 +750,7 @@ static struct cxl_port *cxl_port_alloc(struct device *uport_dev,
+ 		dev->parent = uport_dev;
+ 
+ 	ida_init(&port->decoder_ida);
++	ida_init(&port->cache_ida);
+ 	port->hdm_end = -1;
+ 	port->commit_end = -1;
+ 	xa_init(&port->dports);
+@@ -2414,6 +2415,234 @@ int cxl_decoder_autoremove(struct device *host, struct cxl_decoder *cxld)
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_decoder_autoremove, "CXL");
+ 
++static bool cache_decoder_committed(struct cxl_dport *dport)
++{
++	u32 cap, stat;
++
++	cap = readl(dport->regs.cidd + CXL_CACHE_IDD_CAP_OFFSET);
++	if (!(cap & CXL_CACHE_IDD_CAP_COMMIT_REQUIRED))
++		return true;
++
++	stat = readl(dport->regs.cidd + CXL_CACHE_IDD_STAT_OFFSET);
++	return (stat & CXL_CACHE_IDD_STAT_COMMITTED);
++}
++
++static bool cache_decoder_valid(struct cxl_dport *dport, int id, bool endpoint)
++{
++	struct pci_dev *pdev = to_pci_dev(dport->dport_dev);
++	bool flit_256b = cxl_pci_flit_256(pdev);
++	u32 ctrl;
++
++	if (id && !flit_256b)
++		return false;
++
++	ctrl = readl(dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++	if ((endpoint || !flit_256b) &&
++	    !(ctrl & CXL_CACHE_IDD_CTRL_ASGN_ID))
++		return false;
++	else if (!(ctrl & CXL_CACHE_IDD_CTRL_FWD_ID))
++		return false;
++
++	return true;
++}
++
++static int cxl_dport_get_cache_id(struct cxl_dport *dport,
++				  struct cxl_port *endpoint)
++{
++	u32 ctrl;
++	int id;
++
++	if (!is_cxl_endpoint(endpoint))
++		return CXL_CACHE_ID_NO_ID;
++
++	ctrl = readl(dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++	if (ctrl & CXL_CACHE_IDD_CTRL_TYPE2)
++		id = FIELD_GET(CXL_CACHE_IDD_CTRL_TYPE2_ID_MASK, ctrl);
++	else
++		id = FIELD_GET(CXL_CACHE_IDD_CTRL_LOCAL_ID_MASK, ctrl);
++
++	if (!cache_decoder_valid(dport, is_cxl_endpoint(endpoint), id) ||
++	    !cache_decoder_committed(dport))
++		return CXL_CACHE_ID_NO_ID;
++
++	return id;
++}
++
++static bool cache_idrt_committed(struct cxl_port *port)
++{
++	u32 cap, stat;
++
++	cap = readl(port->regs.cidrt + CXL_CACHE_IDRT_CAP_OFFSET);
++	if (!(cap & CXL_CACHE_IDRT_CAP_COMMIT_REQUIRED))
++		return true;
++
++	stat = readl(port->regs.cidrt + CXL_CACHE_IDRT_STAT_OFFSET);
++	return (stat & CXL_CACHE_IDRT_STAT_COMMITTED);
++}
++
++static bool cache_idrt_entry_valid(struct cxl_port *port, int id)
++{
++	u16 target;
++	u32 cap;
++
++	cap = readl(port->regs.cidrt + CXL_CACHE_IDRT_CAP_OFFSET);
++	if (FIELD_GET(CXL_CACHE_IDRT_CAP_CNT_MASK, cap) <= id)
++		return false;
++
++	target = readw(port->regs.cidrt + CXL_CACHE_IDRT_TARGETN_OFFSET(id));
++	return (target & CXL_CACHE_IDRT_TARGETN_VALID);
++}
++
++int cxl_endpoint_map_cache_id_regs(struct cxl_port *port)
++{
++	struct cxl_dport *parent_dport = port->parent_dport;
++	int rc;
++
++	if (!is_cxl_cachedev(port->uport_dev))
++		return -EINVAL;
++
++	port = parent_port_of(port);
++	while (port) {
++		if (!port->reg_map.component_map.cidrt.valid)
++			return -ENXIO;
++
++		scoped_guard(device, &port->dev) {
++			if (!port->regs.cidrt) {
++				rc = cxl_map_component_regs(
++					&port->reg_map, &port->regs,
++					BIT(CXL_CM_CAP_CAP_ID_CIDRT));
++				if (rc)
++					return rc;
++			}
++		}
++
++		/*
++		 * Parent dports of host bridges are cxl root (ACPI0017) dports
++		 * and don't have cache id decoders.
++		 */
++		if (is_cxl_root(parent_dport->port))
++			break;
++
++		if (!parent_dport->reg_map.component_map.cidd.valid)
++			return -ENXIO;
++
++		scoped_guard(device, &parent_dport->port->dev) {
++			if (!parent_dport->regs.cidd) {
++				rc = cxl_map_component_regs(
++					&parent_dport->reg_map,
++					&parent_dport->regs.component,
++					BIT(CXL_CM_CAP_CAP_ID_CIDD));
++				if (rc)
++					return rc;
++			}
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_endpoint_map_cache_id_regs, "CXL");
++
++/**
++ * cxl_endpoint_allocate_cache_id - Allocate a cache id @id on the endpoint's
++ * host bridge.
++ * @endpoint: Endpoint port representing a CXL.cache device
++ * @id: Cache id to attempt to allocate
++ *
++ * Returns rc < 0 if id allocation fails. Returns allocated id otherwise.
++ */
++int cxl_endpoint_allocate_cache_id(struct cxl_port *endpoint, int id)
++{
++	struct cxl_cachedev *cxlcd;
++	struct cxl_port *hb;
++	int nr_hdmd;
++	u32 cap;
++
++	if (!is_cxl_cachedev(endpoint->uport_dev) || id < 0)
++		return -EINVAL;
++	cxlcd = to_cxl_cachedev(endpoint->uport_dev);
++
++	hb = parent_port_of(endpoint);
++	while (!is_cxl_host_bridge(&hb->dev))
++		hb = parent_port_of(hb);
++
++	if (cxl_cachedev_is_type2(cxlcd) && cxlcd->cxlds->hdmd) {
++		cap = readl(hb->regs.cidrt + CXL_CACHE_IDRT_CAP_OFFSET);
++		nr_hdmd = FIELD_GET(CXL_CACHE_IDRT_CAP_TYPE2_CNT_MASK, cap);
++
++		guard(device)(&hb->dev);
++		if (hb->nr_hdmd + 1 >= nr_hdmd)
++			return -EINVAL;
++
++		hb->nr_hdmd++;
++	}
++
++	return ida_alloc_range(&hb->cache_ida, id, id, GFP_KERNEL);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_endpoint_allocate_cache_id, "CXL");
++
++void cxl_endpoint_free_cache_id(struct cxl_port *endpoint, int id)
++{
++	struct cxl_cachedev *cxlcd;
++	struct cxl_port *hb;
++
++	if (!is_cxl_cachedev(endpoint->uport_dev))
++		return;
++	cxlcd = to_cxl_cachedev(endpoint->uport_dev);
++
++	hb = endpoint;
++	while (!is_cxl_host_bridge(&hb->dev))
++		hb = parent_port_of(hb);
++
++	if (cxl_cachedev_is_type2(cxlcd) && cxlcd->cxlds->hdmd) {
++		guard(device)(&hb->dev);
++		hb->nr_hdmd--;
++	}
++
++	ida_free(&hb->cache_ida, id);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_endpoint_free_cache_id, "CXL");
++
++/**
++ * cxl_endpoint_get_cache_id - Get the cache id of a CXL.cache endpoint device
++ * @endpoint: Endpoint port representing cache device
++ * @cid: Pointer to store resulting cache id in
++ *
++ * Returns 0 and sets @cid to CXL_CACHE_ID_NO_ID if programmed cache id is
++ * invalid.
++ */
++int cxl_endpoint_get_cache_id(struct cxl_port *endpoint, int *cid)
++{
++	struct cxl_dport *dport = endpoint->parent_dport;
++	struct cxl_port *port = parent_port_of(endpoint);
++	bool ep = true;
++
++	if (!cid)
++		return -EINVAL;
++
++	*cid = cxl_dport_get_cache_id(dport, port);
++
++	while (!is_cxl_root(port)) {
++		if (!cache_idrt_entry_valid(port, *cid) ||
++		    !cache_idrt_committed(port)) {
++			*cid = CXL_CACHE_ID_NO_ID;
++			break;
++		}
++
++		if (!cache_decoder_valid(dport, ep, *cid) ||
++		    !cache_decoder_committed(dport)) {
++			*cid = CXL_CACHE_ID_NO_ID;
++			break;
++		}
++
++		dport = port->parent_dport;
++		port = dport->port;
++		ep = false;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_endpoint_get_cache_id, "CXL");
++
+ /**
+  * __cxl_driver_register - register a driver for the cxl bus
+  * @cxl_drv: cxl driver structure to attach
+diff --git a/drivers/cxl/core/regs.c b/drivers/cxl/core/regs.c
+index 280978b34d2f..545a1b9e026c 100644
+--- a/drivers/cxl/core/regs.c
++++ b/drivers/cxl/core/regs.c
+@@ -98,6 +98,24 @@ void cxl_probe_component_regs(struct device *dev, void __iomem *base,
+ 			length = CXL_SNOOP_CAPABILITY_LENGTH;
+ 			rmap = &map->snoop;
+ 			break;
++		case CXL_CM_CAP_CAP_ID_CIDRT: {
++			int entry_cnt;
++
++			dev_dbg(dev,
++				"found Cache ID Route Table capability (0x%x)\n",
++				offset);
++			entry_cnt = FIELD_GET(CXL_CACHE_IDRT_CAP_CNT_MASK, hdr);
++			length = 2 * entry_cnt + 0x10;
++			rmap = &map->cidrt;
++			break;
++		}
++		case CXL_CM_CAP_CAP_ID_CIDD:
++			dev_dbg(dev,
++				"found Cache ID Decoder capability (0x%x\n",
++				offset);
++			length = CXL_CACHE_IDD_CAPABILITY_LENGTH;
++			rmap = &map->cidd;
++			break;
+ 		default:
+ 			dev_dbg(dev, "Unknown CM cap ID: %d (0x%x)\n", cap_id,
+ 				offset);
+@@ -218,6 +236,8 @@ int cxl_map_component_regs(const struct cxl_register_map *map,
+ 		{ &map->component_map.hdm_decoder, &regs->hdm_decoder },
+ 		{ &map->component_map.ras, &regs->ras },
+ 		{ &map->component_map.snoop, &regs->snoop },
++		{ &map->component_map.cidrt, &regs->cidrt },
++		{ &map->component_map.cidd, &regs->cidd },
+ 	};
+ 	int i;
+ 
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index de29ffc3d74f..f4dc912d67ed 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -42,6 +42,8 @@ extern const struct nvdimm_security_ops *cxl_security_ops;
+ #define   CXL_CM_CAP_CAP_ID_RAS 0x2
+ #define   CXL_CM_CAP_CAP_ID_HDM 0x5
+ #define   CXL_CM_CAP_CAP_ID_SNOOP 0x8
++#define   CXL_CM_CAP_CAP_ID_CIDRT 0xD
++#define   CXL_CM_CAP_CAP_ID_CIDD 0xE
+ #define   CXL_CM_CAP_CAP_HDM_VERSION 1
+ 
+ /* HDM decoders CXL 2.0 8.2.5.12 CXL HDM Decoder Capability Structure */
+@@ -159,6 +161,30 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define CXL_SNOOP_FILTER_SIZE_OFFSET 0x4
+ #define CXL_SNOOP_CAPABILITY_LENGTH 0x8
+ 
++/* CXL 3.2 8.2.4.28 CXL Cache ID Route Table Capability Structure */
++#define CXL_CACHE_IDRT_CAP_OFFSET 0x0
++#define   CXL_CACHE_IDRT_CAP_CNT_MASK GENMASK(4, 0)
++#define   CXL_CACHE_IDRT_CAP_TYPE2_CNT_MASK GENMASK(11, 8)
++#define   CXL_CACHE_IDRT_CAP_COMMIT_REQUIRED BIT(16)
++#define CXL_CACHE_IDRT_STAT_OFFSET 0x8
++#define   CXL_CACHE_IDRT_STAT_COMMITTED BIT(0)
++#define CXL_CACHE_IDRT_TARGETN_OFFSET(n) (0x10 + (2 * (n)))
++#define   CXL_CACHE_IDRT_TARGETN_VALID BIT(0)
++#define   CXL_CACHE_IDRT_TARGETN_PORTN GENMASK(15, 8)
++
++/* CXL 3.2 8.2.4.29 CXL Cache ID Decoder Capability Structure */
++#define CXL_CACHE_IDD_CAP_OFFSET 0x0
++#define   CXL_CACHE_IDD_CAP_COMMIT_REQUIRED BIT(0)
++#define CXL_CACHE_IDD_CTRL_OFFSET 0x4
++#define   CXL_CACHE_IDD_CTRL_FWD_ID BIT(0)
++#define   CXL_CACHE_IDD_CTRL_ASGN_ID BIT(1)
++#define   CXL_CACHE_IDD_CTRL_TYPE2 BIT(2)
++#define   CXL_CACHE_IDD_CTRL_TYPE2_ID_MASK GENMASK(11, 8)
++#define   CXL_CACHE_IDD_CTRL_LOCAL_ID_MASK GENMASK(19, 16)
++#define CXL_CACHE_IDD_STAT_OFFSET 0x8
++#define   CXL_CACHE_IDD_STAT_COMMITTED BIT(0)
++#define CXL_CACHE_IDD_CAPABILITY_LENGTH 0xC
++
+ /* CXL 2.0 8.2.8.1 Device Capabilities Array Register */
+ #define CXLDEV_CAP_ARRAY_OFFSET 0x0
+ #define   CXLDEV_CAP_ARRAY_CAP_ID 0
+@@ -223,6 +249,8 @@ struct cxl_regs {
+ 		void __iomem *hdm_decoder;
+ 		void __iomem *ras;
+ 		void __iomem *snoop;
++		void __iomem *cidrt;
++		void __iomem *cidd;
+ 	);
+ 	/*
+ 	 * Common set of CXL Device register block base pointers
+@@ -266,6 +294,8 @@ struct cxl_component_reg_map {
+ 	struct cxl_reg_map hdm_decoder;
+ 	struct cxl_reg_map ras;
+ 	struct cxl_reg_map snoop;
++	struct cxl_reg_map cidrt;
++	struct cxl_reg_map cidd;
+ };
+ 
+ struct cxl_device_reg_map {
+@@ -609,7 +639,9 @@ struct cxl_dax_region {
+  * @parent_dport: dport that points to this port in the parent
+  * @decoder_ida: allocator for decoder ids
+  * @reg_map: component and ras register mapping parameters
++ * @regs: component register mappings
+  * @nr_dports: number of entries in @dports
++ * @nr_hdmd: number of type 2 devices using hdm-d flows below this port
+  * @hdm_end: track last allocated HDM decoder instance for allocation ordering
+  * @commit_end: cursor to track highest committed decoder for commit ordering
+  * @dead: last ep has been removed, force port re-creation
+@@ -618,6 +650,7 @@ struct cxl_dax_region {
+  * @cdat_available: Should a CDAT attribute be available in sysfs
+  * @pci_latency: Upstream latency in picoseconds
+  * @component_reg_phys: Physical address of component register
++ * @cache_ida: cache id allocator
+  */
+ struct cxl_port {
+ 	struct device dev;
+@@ -630,7 +663,9 @@ struct cxl_port {
+ 	struct cxl_dport *parent_dport;
+ 	struct ida decoder_ida;
+ 	struct cxl_register_map reg_map;
++	struct cxl_component_regs regs;
+ 	int nr_dports;
++	int nr_hdmd;
+ 	int hdm_end;
+ 	int commit_end;
+ 	bool dead;
+@@ -642,6 +677,7 @@ struct cxl_port {
+ 	bool cdat_available;
+ 	long pci_latency;
+ 	resource_size_t component_reg_phys;
++	struct ida cache_ida;
+ };
+ 
+ /**
+@@ -769,6 +805,7 @@ struct cxl_dpa_info {
+ 	int nr_partitions;
+ };
+ 
++#define CXL_CACHE_ID_NO_ID (-1)
+ #define CXL_SNOOP_ID_NO_ID (-1)
+ 
+ /**
+@@ -780,6 +817,7 @@ struct cxl_cache_state {
+ 	u64 size;
+ 	u32 unit;
+ 	int snoop_id;
++	int cache_id;
+ };
+ 
+ /**
+@@ -797,6 +835,7 @@ struct cxl_cache_state {
+  * @cxl_dvsec: Offset to the PCIe device DVSEC
+  * @rcd: operating in RCD mode (CXL 3.0 9.11.8 CXL Devices Attached to an RCH)
+  * @media_ready: Indicate whether the device media is usable
++ * @hdmd: Whether this device is using HDM-D flows
+  * @dpa_res: Overall DPA resource tree for the device
+  * @part: DPA partition array
+  * @nr_partitions: Number of DPA partitions
+@@ -815,6 +854,7 @@ struct cxl_dev_state {
+ 	int cxl_dvsec;
+ 	bool rcd;
+ 	bool media_ready;
++	bool hdmd;
+ 	struct resource dpa_res;
+ 	struct cxl_dpa_partition part[CXL_NR_PARTITIONS_MAX];
+ 	unsigned int nr_partitions;
+@@ -946,6 +986,10 @@ static inline int cxl_root_decoder_autoremove(struct device *host,
+ 	return cxl_decoder_autoremove(host, &cxlrd->cxlsd.cxld);
+ }
+ int cxl_endpoint_autoremove(struct device *ep_dev, struct cxl_port *endpoint);
++int cxl_endpoint_map_cache_id_regs(struct cxl_port *endpoint);
++int cxl_endpoint_get_cache_id(struct cxl_port *endpoint, int *cid);
++int cxl_endpoint_allocate_cache_id(struct cxl_port *endpoint, int id);
++void cxl_endpoint_free_cache_id(struct cxl_port *endpoint, int id);
+ 
+ /**
+  * struct cxl_endpoint_dvsec_info - Cached DVSEC info
+diff --git a/drivers/cxl/cxlcache.h b/drivers/cxl/cxlcache.h
+index 6409e25dd1b4..fe9e44fda641 100644
+--- a/drivers/cxl/cxlcache.h
++++ b/drivers/cxl/cxlcache.h
+@@ -28,7 +28,8 @@ static inline struct cxl_cachedev *to_cxl_cachedev(struct device *dev)
+ 
+ bool is_cxl_cachedev(const struct device *dev);
+ 
+-int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds);
++int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds, bool hdmd);
+ struct cxl_cachedev *devm_cxl_add_cachedev(struct device *host,
+ 					   struct cxl_dev_state *cxlds);
++bool cxl_cachedev_is_type2(struct cxl_cachedev *cxlcd);
+ #endif
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index ae38b9965a84..c1d1d28bee5c 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -7,6 +7,7 @@
+ #include "cxlmem.h"
+ #include "cxlpci.h"
+ #include "private.h"
++#include "cxlcache.h"
+ 
+ /**
+  * DOC: cxl port
+@@ -95,10 +96,33 @@ static int cxl_mem_endpoint_port_probe(struct cxl_port *port)
+ 	return 0;
+ }
+ 
++static void free_cache_id(void *data)
++{
++	struct cxl_cachedev *cxlcd = data;
++	int id = cxlcd->cxlds->cstate.cache_id;
++
++	cxl_endpoint_free_cache_id(cxlcd->endpoint, id);
++}
++
+ static int cxl_cache_endpoint_port_probe(struct cxl_port *port)
+ {
+-	/* No further set up required for CXL.cache devices */
+-	return 0;
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(port->uport_dev);
++	int rc, id;
++
++	rc = cxl_endpoint_map_cache_id_regs(port);
++	if (rc)
++		return rc;
++
++	rc = cxl_endpoint_get_cache_id(port, &id);
++	if (rc)
++		return rc;
++
++	rc = cxl_endpoint_allocate_cache_id(port, id);
++	if (rc < 0)
++		return rc;
++
++	cxlcd->cxlds->cstate.cache_id = id;
++	return devm_add_action_or_reset(&cxlcd->dev, free_cache_id, cxlcd);
+ }
+ 
+ static int cxl_endpoint_port_probe(struct cxl_port *port)
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 14/17] cxl/port: Add cache id programming
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:29 -0600
+Message-Id: <20251111214032.8188-15-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add programming cache ids for CXL.cache endpoint devices as part of
+cxl_cache_endpoint_probe().
+
+Programming the cache id for a CXL.cache endpoint requires allocating
+a cache id beforehand. The cache id can be programmed by the platform
+firmware, in which case calling cxl_endpoint_get_cache_id() will return
+the pre-programmed id. In the event the id is not programmed call
+cxl_endpoint_allocate_cache_id() with a value of CXL_CACHE_ID_NO_ID,
+which will return the first available id. Program the relevant cache
+id decoders and route tables for a device by calling
+devm_cxl_program_cache_id().
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/core/port.c | 284 +++++++++++++++++++++++++++++++++++++++-
+ drivers/cxl/cxl.h       |  12 ++
+ drivers/cxl/port.c      |  27 ++--
+ 3 files changed, 310 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 1504631ae620..e6e25a201ff9 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -2546,7 +2546,7 @@ EXPORT_SYMBOL_NS_GPL(cxl_endpoint_map_cache_id_regs, "CXL");
+  * cxl_endpoint_allocate_cache_id - Allocate a cache id @id on the endpoint's
+  * host bridge.
+  * @endpoint: Endpoint port representing a CXL.cache device
+- * @id: Cache id to attempt to allocate
++ * @id: Cache id to attempt to allocate, CXL_CACHE_ID_NO_ID for any id
+  *
+  * Returns rc < 0 if id allocation fails. Returns allocated id otherwise.
+  */
+@@ -2570,13 +2570,16 @@ int cxl_endpoint_allocate_cache_id(struct cxl_port *endpoint, int id)
+ 		nr_hdmd = FIELD_GET(CXL_CACHE_IDRT_CAP_TYPE2_CNT_MASK, cap);
+ 
+ 		guard(device)(&hb->dev);
+-		if (hb->nr_hdmd + 1 >= nr_hdmd)
++		if (hb->nr_hdmd == nr_hdmd)
+ 			return -EINVAL;
+ 
+ 		hb->nr_hdmd++;
+ 	}
+ 
+-	return ida_alloc_range(&hb->cache_ida, id, id, GFP_KERNEL);
++	if (id == CXL_CACHE_ID_NO_ID)
++		return ida_alloc(&hb->cache_ida, GFP_KERNEL);
++	else
++		return ida_alloc_range(&hb->cache_ida, id, id, GFP_KERNEL);
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_endpoint_allocate_cache_id, "CXL");
+ 
+@@ -2602,6 +2605,211 @@ void cxl_endpoint_free_cache_id(struct cxl_port *endpoint, int id)
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_endpoint_free_cache_id, "CXL");
+ 
++static unsigned long cxl_cache_id_compute_timeout(u8 scale, u8 base)
++{
++	unsigned long timeout = base;
++
++	/* Give the hardware 1 millisecond just in case */
++	if (!timeout)
++		timeout = 1;
++
++	/*
++	 * The timeout scale in the cache id decoder status register is encoded
++	 * as 10 ^ (scale) microseconds. So, to convert to millis we multiply by
++	 * 10 until the scale == 1 ms.
++	 */
++	while (scale > 3) {
++		timeout *= 10;
++		scale--;
++	}
++
++	return msecs_to_jiffies(timeout);
++}
++
++static int cxl_commit_cache_decoder(struct cxl_dport *dport)
++{
++	unsigned long timeout, start;
++	u32 cap, ctrl, stat;
++	u8 scale, base;
++
++	cap = readl(dport->regs.cidd + CXL_CACHE_IDD_CAP_OFFSET);
++	if (!(cap & CXL_CACHE_IDD_CAP_COMMIT_REQUIRED))
++		return 0;
++
++	ctrl = readl(dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++	if (ctrl & CXL_CACHE_IDD_CTRL_COMMIT) {
++		ctrl &= ~CXL_CACHE_IDD_CTRL_COMMIT;
++		writel(ctrl, dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++	}
++
++	stat = readl(dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++	scale = FIELD_PREP(CXL_CACHE_IDD_STAT_TIME_SCALE_MASK, stat);
++	base = FIELD_PREP(CXL_CACHE_IDD_STAT_TIME_BASE_MASK, stat);
++	timeout = cxl_cache_id_compute_timeout(scale, base);
++
++	ctrl &= CXL_CACHE_IDD_CTRL_COMMIT;
++	writel(ctrl, dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++
++	start = jiffies;
++	do {
++		stat = readl(dport->regs.cidd + CXL_CACHE_IDD_STAT_OFFSET);
++		if (stat & CXL_CACHE_IDD_STAT_COMMITTED)
++			return 0;
++
++		if (stat & CXL_CACHE_IDD_STAT_ERR_COMMIT)
++			return -EBUSY;
++	} while (time_before(start, start + timeout));
++
++	return -ETIMEDOUT;
++}
++
++static int cxl_program_cache_decoder(struct cxl_dport *dport, int id,
++				     bool hdmd, bool endpoint)
++{
++	u32 ctrl, orig;
++	int rc;
++
++	ctrl = readl(dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++	orig = ctrl;
++
++	if (endpoint) {
++		ctrl &= CXL_CACHE_IDD_CTRL_ASGN_ID;
++		ctrl &= FIELD_PREP(CXL_CACHE_IDD_CTRL_LOCAL_ID_MASK, id);
++	} else {
++		ctrl &= CXL_CACHE_IDD_CTRL_FWD_ID;
++	}
++
++	if (hdmd) {
++		ctrl &= CXL_CACHE_IDD_CTRL_TYPE2;
++		ctrl &= FIELD_PREP(CXL_CACHE_IDD_CTRL_TYPE2_ID_MASK, id);
++	}
++
++	if (ctrl == orig)
++		return 0;
++
++	writel(ctrl, dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++
++	rc = cxl_commit_cache_decoder(dport);
++	if (rc)
++		writel(orig, dport->regs.cidd + CXL_CACHE_IDD_CTRL_OFFSET);
++
++	return rc;
++}
++
++static int cxl_commit_cache_idrt(struct cxl_port *port)
++{
++	unsigned long timeout, start;
++	u32 cap, ctrl, stat;
++	u8 scale, base;
++
++	cap = readl(port->regs.cidrt + CXL_CACHE_IDRT_CAP_OFFSET);
++	if (!(cap & CXL_CACHE_IDRT_CAP_COMMIT_REQUIRED))
++		return 0;
++
++	ctrl = readl(port->regs.cidrt + CXL_CACHE_IDRT_CTRL_OFFSET);
++	if (ctrl & CXL_CACHE_IDRT_CTRL_COMMIT) {
++		ctrl &= ~CXL_CACHE_IDRT_CTRL_COMMIT;
++		writel(ctrl, port->regs.cidd + CXL_CACHE_IDRT_CTRL_OFFSET);
++	}
++
++	stat = readl(port->regs.cidrt + CXL_CACHE_IDRT_CTRL_OFFSET);
++	scale = FIELD_PREP(CXL_CACHE_IDRT_STAT_TIME_SCALE_MASK, stat);
++	base = FIELD_PREP(CXL_CACHE_IDRT_STAT_TIME_BASE_MASK, stat);
++	timeout = cxl_cache_id_compute_timeout(scale, base);
++
++	ctrl &= CXL_CACHE_IDRT_CTRL_COMMIT;
++	writel(ctrl, port->regs.cidrt + CXL_CACHE_IDRT_CTRL_OFFSET);
++
++	start = jiffies;
++	do {
++		stat = readl(port->regs.cidrt + CXL_CACHE_IDRT_STAT_OFFSET);
++		if (stat & CXL_CACHE_IDRT_STAT_COMMITTED)
++			return 0;
++
++		if (stat & CXL_CACHE_IDRT_STAT_ERR_COMMIT)
++			return -EBUSY;
++	} while (time_before(jiffies, start + timeout));
++
++	return -ETIMEDOUT;
++}
++
++static int cxl_program_cache_idrt_entry(struct cxl_port *port, int id,
++					struct cxl_dport *dport, bool valid)
++{
++	u16 target, orig;
++	int rc;
++
++	target = readw(port->regs.cidrt + CXL_CACHE_IDRT_TARGETN_OFFSET(id));
++	orig = target;
++
++	/*
++	 * Touching the port number field while the entry is valid is
++	 * undefined behavior.
++	 */
++	if (target & CXL_CACHE_IDRT_TARGETN_VALID && valid) {
++		if (FIELD_GET(CXL_CACHE_IDRT_TARGETN_PORTN, target) !=
++		    dport->port_id)
++			return -EINVAL;
++
++		return 0;
++	}
++
++	target = FIELD_PREP(CXL_CACHE_IDRT_TARGETN_PORTN, dport->port_id);
++	if (valid)
++		target &= CXL_CACHE_IDRT_TARGETN_VALID;
++	else
++		target &= ~CXL_CACHE_IDRT_TARGETN_VALID;
++
++	if (orig == target)
++		return 0;
++
++	writew(target, port->regs.cidrt + CXL_CACHE_IDRT_TARGETN_OFFSET(id));
++	rc = cxl_commit_cache_idrt(port);
++	if (rc)
++		writew(orig,
++		       port->regs.cidrt + CXL_CACHE_IDRT_TARGETN_OFFSET(id));
++
++	return rc;
++}
++
++static DECLARE_RWSEM(cache_id_rwsem);
++
++static void __cxl_endpoint_deprogram_cache_id(struct cxl_port *ep,
++					      struct cxl_port *stop, int id)
++{
++	struct cxl_dport *dport = ep->parent_dport;
++	struct cxl_port *port = parent_port_of(ep);
++	int rc;
++
++	while (port != stop) {
++		dport->nr_cachedevs--;
++		if (dport->nr_cachedevs == 0) {
++			rc = cxl_program_cache_idrt_entry(port, id, dport, false);
++			if (rc)
++				dev_warn(&port->dev,
++					 "failed to decommit cache id target%d\n",
++					 id);
++		}
++
++		dport = port->parent_dport;
++		port = parent_port_of(port);
++	}
++}
++
++struct cxl_cache_id_ctx {
++	struct cxl_port *endpoint;
++	struct cxl_port *stop;
++	int id;
++};
++
++static void cxl_endpoint_deprogram_cache_id(void *data)
++{
++	struct cxl_cache_id_ctx *ctx = data;
++
++	guard(rwsem_write)(&cache_id_rwsem);
++	__cxl_endpoint_deprogram_cache_id(ctx->endpoint, ctx->stop, ctx->id);
++}
++
+ /**
+  * cxl_endpoint_get_cache_id - Get the cache id of a CXL.cache endpoint device
+  * @endpoint: Endpoint port representing cache device
+@@ -2614,11 +2822,19 @@ int cxl_endpoint_get_cache_id(struct cxl_port *endpoint, int *cid)
+ {
+ 	struct cxl_dport *dport = endpoint->parent_dport;
+ 	struct cxl_port *port = parent_port_of(endpoint);
++	struct cxl_cachedev *cxlcd;
+ 	bool ep = true;
+ 
+-	if (!cid)
++	if (!cid || !is_cxl_cachedev(endpoint->uport_dev))
+ 		return -EINVAL;
++	cxlcd = to_cxl_cachedev(endpoint->uport_dev);
+ 
++	struct cxl_cache_id_ctx *ctx __free(kfree) =
++		kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	guard(rwsem_read)(&cache_id_rwsem);
+ 	*cid = cxl_dport_get_cache_id(dport, port);
+ 
+ 	while (!is_cxl_root(port)) {
+@@ -2639,10 +2855,68 @@ int cxl_endpoint_get_cache_id(struct cxl_port *endpoint, int *cid)
+ 		ep = false;
+ 	}
+ 
+-	return 0;
++	*ctx = (struct cxl_cache_id_ctx) {
++		.endpoint = endpoint,
++		.stop = port,
++		.id = *cid,
++	};
++
++	return devm_add_action(&cxlcd->dev, cxl_endpoint_deprogram_cache_id,
++			       no_free_ptr(ctx));
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_endpoint_get_cache_id, "CXL");
+ 
++int devm_cxl_endpoint_program_cache_id(struct cxl_port *endpoint, int id)
++{
++	struct cxl_dport *dport = endpoint->parent_dport;
++	struct cxl_port *port = parent_port_of(endpoint);
++	struct cxl_cachedev *cxlcd;
++	bool hdmd, ep = true;
++	int rc;
++
++	if (!is_cxl_cachedev(endpoint->uport_dev))
++		return -EINVAL;
++
++	struct cxl_cache_id_ctx *ctx __free(kfree) =
++		kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++
++	cxlcd = to_cxl_cachedev(endpoint->uport_dev);
++	hdmd = cxl_cachedev_is_type2(cxlcd) && cxlcd->cxlds->hdmd;
++
++	guard(rwsem_write)(&cache_id_rwsem);
++	while (!is_cxl_root(port)) {
++		rc = cxl_program_cache_idrt_entry(port, id, dport, true);
++		if (rc)
++			goto err;
++
++		rc = cxl_program_cache_decoder(dport, id, hdmd, ep);
++		if (rc)
++			goto err;
++
++		ep = false;
++		dport->nr_cachedevs++;
++		dport = port->parent_dport;
++		port = parent_port_of(port);
++	}
++
++	*ctx = (struct cxl_cache_id_ctx) {
++		.endpoint = endpoint,
++		.stop = port,
++		.id = id,
++	};
++
++	return devm_add_action_or_reset(&cxlcd->dev,
++					cxl_endpoint_deprogram_cache_id,
++					no_free_ptr(ctx));
++
++err:
++	__cxl_endpoint_deprogram_cache_id(endpoint, parent_port_of(port), id);
++	return rc;
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_endpoint_program_cache_id, "CXL");
++
+ /**
+  * __cxl_driver_register - register a driver for the cxl bus
+  * @cxl_drv: cxl driver structure to attach
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index f4dc912d67ed..7919c4466b0c 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -166,8 +166,13 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define   CXL_CACHE_IDRT_CAP_CNT_MASK GENMASK(4, 0)
+ #define   CXL_CACHE_IDRT_CAP_TYPE2_CNT_MASK GENMASK(11, 8)
+ #define   CXL_CACHE_IDRT_CAP_COMMIT_REQUIRED BIT(16)
++#define CXL_CACHE_IDRT_CTRL_OFFSET 0x4
++#define   CXL_CACHE_IDRT_CTRL_COMMIT BIT(0)
+ #define CXL_CACHE_IDRT_STAT_OFFSET 0x8
+ #define   CXL_CACHE_IDRT_STAT_COMMITTED BIT(0)
++#define   CXL_CACHE_IDRT_STAT_ERR_COMMIT BIT(1)
++#define   CXL_CACHE_IDRT_STAT_TIME_SCALE_MASK GENMASK(11, 8)
++#define   CXL_CACHE_IDRT_STAT_TIME_BASE_MASK GENMASK(15, 12)
+ #define CXL_CACHE_IDRT_TARGETN_OFFSET(n) (0x10 + (2 * (n)))
+ #define   CXL_CACHE_IDRT_TARGETN_VALID BIT(0)
+ #define   CXL_CACHE_IDRT_TARGETN_PORTN GENMASK(15, 8)
+@@ -179,10 +184,14 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define   CXL_CACHE_IDD_CTRL_FWD_ID BIT(0)
+ #define   CXL_CACHE_IDD_CTRL_ASGN_ID BIT(1)
+ #define   CXL_CACHE_IDD_CTRL_TYPE2 BIT(2)
++#define   CXL_CACHE_IDD_CTRL_COMMIT BIT(3)
+ #define   CXL_CACHE_IDD_CTRL_TYPE2_ID_MASK GENMASK(11, 8)
+ #define   CXL_CACHE_IDD_CTRL_LOCAL_ID_MASK GENMASK(19, 16)
+ #define CXL_CACHE_IDD_STAT_OFFSET 0x8
+ #define   CXL_CACHE_IDD_STAT_COMMITTED BIT(0)
++#define   CXL_CACHE_IDD_STAT_ERR_COMMIT BIT(1)
++#define   CXL_CACHE_IDD_STAT_TIME_SCALE_MASK GENMASK(11, 8)
++#define   CXL_CACHE_IDD_STAT_TIME_BASE_MASK GENMASK(15, 12)
+ #define CXL_CACHE_IDD_CAPABILITY_LENGTH 0xC
+ 
+ /* CXL 2.0 8.2.8.1 Device Capabilities Array Register */
+@@ -726,6 +735,7 @@ struct cxl_rcrb_info {
+  * @coord: access coordinates (bandwidth and latency performance attributes)
+  * @link_latency: calculated PCIe downstream latency
+  * @gpf_dvsec: Cached GPF port DVSEC
++ * @nr_cachedevs: Number of CXL.cache devices with a cache id below this dport
+  */
+ struct cxl_dport {
+ 	struct device *dport_dev;
+@@ -739,6 +749,7 @@ struct cxl_dport {
+ 	long link_latency;
+ 	int gpf_dvsec;
+ 	int snoop_id;
++	int nr_cachedevs;
+ };
+ 
+ /**
+@@ -990,6 +1001,7 @@ int cxl_endpoint_map_cache_id_regs(struct cxl_port *endpoint);
+ int cxl_endpoint_get_cache_id(struct cxl_port *endpoint, int *cid);
+ int cxl_endpoint_allocate_cache_id(struct cxl_port *endpoint, int id);
+ void cxl_endpoint_free_cache_id(struct cxl_port *endpoint, int id);
++int devm_cxl_endpoint_program_cache_id(struct cxl_port *endpoint, int id);
+ 
+ /**
+  * struct cxl_endpoint_dvsec_info - Cached DVSEC info
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index c1d1d28bee5c..4cecb731ec5b 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -27,6 +27,8 @@
+  * PCIe topology.
+  */
+ 
++static DEFINE_MUTEX(cache_id_lock);
++
+ static void schedule_detach(void *cxlmd)
+ {
+ 	schedule_cxl_memdev_detach(cxlmd);
+@@ -99,30 +101,39 @@ static int cxl_mem_endpoint_port_probe(struct cxl_port *port)
+ static void free_cache_id(void *data)
+ {
+ 	struct cxl_cachedev *cxlcd = data;
+-	int id = cxlcd->cxlds->cstate.cache_id;
++	struct cxl_cache_state *cstate = &cxlcd->cxlds->cstate;
+ 
+-	cxl_endpoint_free_cache_id(cxlcd->endpoint, id);
++	cxl_endpoint_free_cache_id(cxlcd->endpoint, cstate->cache_id);
++	cstate->cache_id = CXL_CACHE_ID_NO_ID;
+ }
+ 
+ static int cxl_cache_endpoint_port_probe(struct cxl_port *port)
+ {
+ 	struct cxl_cachedev *cxlcd = to_cxl_cachedev(port->uport_dev);
+-	int rc, id;
++	int rc, orig, id;
+ 
+ 	rc = cxl_endpoint_map_cache_id_regs(port);
+ 	if (rc)
+ 		return rc;
+ 
+-	rc = cxl_endpoint_get_cache_id(port, &id);
++	guard(mutex)(&cache_id_lock);
++	rc = cxl_endpoint_get_cache_id(port, &orig);
+ 	if (rc)
+ 		return rc;
+ 
+-	rc = cxl_endpoint_allocate_cache_id(port, id);
+-	if (rc < 0)
+-		return rc;
++	id = cxl_endpoint_allocate_cache_id(port, orig);
++	if (id < 0)
++		return id;
+ 
+ 	cxlcd->cxlds->cstate.cache_id = id;
+-	return devm_add_action_or_reset(&cxlcd->dev, free_cache_id, cxlcd);
++	rc = devm_add_action_or_reset(&cxlcd->dev, free_cache_id, cxlcd);
++	if (rc)
++		return rc;
++
++	if (orig == CXL_CACHE_ID_NO_ID)
++		return devm_cxl_endpoint_program_cache_id(port, id);
++
++	return 0;
+ }
+ 
+ static int cxl_endpoint_port_probe(struct cxl_port *port)
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 15/17] cxl/port: Bypass cache id for singleton cache
+ devices
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:30 -0600
+Message-Id: <20251111214032.8188-16-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+The CXL cache id capability is required to have multiple CXL cache
+devices in the same virtual hierarchy (VH), but is not required if there
+is only a single cache device in the VH. If the host does not support
+the cache id capability and there is only a single device in the VH,
+skip allocation and programming of the capability.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/core/port.c |  1 +
+ drivers/cxl/port.c      | 34 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index e6e25a201ff9..3d9da6c3f672 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -617,6 +617,7 @@ struct cxl_port *parent_port_of(struct cxl_port *port)
+ 		return NULL;
+ 	return port->parent_dport->port;
+ }
++EXPORT_SYMBOL_NS_GPL(parent_port_of, "CXL");
+ 
+ static void unregister_port(void *_port)
+ {
+diff --git a/drivers/cxl/port.c b/drivers/cxl/port.c
+index 4cecb731ec5b..68b6d9e34706 100644
+--- a/drivers/cxl/port.c
++++ b/drivers/cxl/port.c
+@@ -98,6 +98,28 @@ static int cxl_mem_endpoint_port_probe(struct cxl_port *port)
+ 	return 0;
+ }
+ 
++static bool cxl_endpoint_is_only_cachedev(struct cxl_port *endpoint)
++{
++	unsigned long index;
++	struct cxl_ep *ep;
++	int cnt;
++
++	for (struct cxl_port *port = endpoint;
++	     !is_cxl_root(parent_port_of(port)); port = parent_port_of(port)) {
++		cnt = 0;
++
++		xa_for_each(&port->endpoints, index, ep) {
++			if (is_cxl_cachedev(ep->ep))
++				cnt++;
++
++			if (cnt > 1)
++				return false;
++		}
++	}
++
++	return true;
++}
++
+ static void free_cache_id(void *data)
+ {
+ 	struct cxl_cachedev *cxlcd = data;
+@@ -113,8 +135,16 @@ static int cxl_cache_endpoint_port_probe(struct cxl_port *port)
+ 	int rc, orig, id;
+ 
+ 	rc = cxl_endpoint_map_cache_id_regs(port);
+-	if (rc)
+-		return rc;
++	if (rc) {
++		/*
++		 * It's fine to not have cache id capabilities if this cachedev
++		 * is the only one in its VH
++		 */
++		if (cxl_endpoint_is_only_cachedev(port))
++			return 0;
++
++		return -EBUSY;
++	}
+ 
+ 	guard(mutex)(&cache_id_lock);
+ 	rc = cxl_endpoint_get_cache_id(port, &orig);
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 16/17] cxl/core: Add cache device attributes
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:31 -0600
+Message-Id: <20251111214032.8188-17-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add sysfs attributes for getting the numa node, CXL cache unit, and
+CXL cache size for a cachedev.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ drivers/cxl/core/cachedev.c | 85 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/drivers/cxl/core/cachedev.c b/drivers/cxl/core/cachedev.c
+index 0b7430450b4e..d8bf18ec0579 100644
+--- a/drivers/cxl/core/cachedev.c
++++ b/drivers/cxl/core/cachedev.c
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Copyright (C) 2025 Advanced Micro Devices, Inc. */
++#include <linux/string_helpers.h>
+ #include <linux/device.h>
+ #include <linux/pci.h>
+ #include "cxlpci.h"
+@@ -32,10 +33,94 @@ static char *cxl_cachedev_devnode(const struct device *dev, umode_t *mode,
+ 	return kasprintf(GFP_KERNEL, "cxl/%s", dev_name(dev));
+ }
+ 
++static ssize_t numa_node_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	return sysfs_emit(buf, "%d\n", dev_to_node(dev));
++}
++static DEVICE_ATTR_RO(numa_node);
++
++static struct attribute *cxl_cachedev_attributes[] = {
++	&dev_attr_numa_node.attr,
++	NULL
++};
++
++static umode_t cxl_cachedev_visible(struct kobject *kobj, struct attribute *a,
++				    int n)
++{
++	if (!IS_ENABLED(CONFIG_NUMA) && a == &dev_attr_numa_node.attr)
++		return 0;
++	return a->mode;
++}
++
++static struct attribute_group cxl_cachedev_attribute_group = {
++	.attrs = cxl_cachedev_attributes,
++	.is_visible = cxl_cachedev_visible,
++};
++
++static ssize_t cache_size_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	struct cxl_cache_state cstate = cxlds->cstate;
++
++	return sysfs_emit(buf, "%llu\n", cstate.size);
++}
++static DEVICE_ATTR_RO(cache_size);
++
++static ssize_t cache_unit_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	struct cxl_cache_state cstate = cxlds->cstate;
++	char unit_buf[32];
++	int rc;
++
++	rc = string_get_size(cstate.size, 1, STRING_UNITS_2, unit_buf,
++			     sizeof(unit_buf) - 1);
++	if (rc <= 0)
++		return -ENXIO;
++
++	return sysfs_emit(buf, "%s\n", unit_buf);
++}
++static DEVICE_ATTR_RO(cache_unit);
++
++static struct attribute *cxl_cachedev_cache_attributes[] = {
++	&dev_attr_cache_size.attr,
++	&dev_attr_cache_unit.attr,
++	NULL
++};
++
++static umode_t cxl_cachedev_cache_visible(struct kobject *kobj,
++					  struct attribute *a, int n)
++{
++	struct device *dev = kobj_to_dev(kobj);
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++
++	if (!cxlds || cxlds->cstate.size == 0)
++		return 0;
++	return a->mode;
++}
++
++static struct attribute_group cxl_cachedev_cache_attribute_group = {
++	.attrs = cxl_cachedev_cache_attributes,
++	.is_visible = cxl_cachedev_cache_visible,
++};
++
++static const struct attribute_group *cxl_cachedev_attribute_groups[] = {
++	&cxl_cachedev_attribute_group,
++	&cxl_cachedev_cache_attribute_group,
++	NULL
++};
++
+ static const struct device_type cxl_cachedev_type = {
+ 	.name = "cxl_cachedev",
+ 	.release = cxl_cachedev_release,
+ 	.devnode = cxl_cachedev_devnode,
++	.groups = cxl_cachedev_attribute_groups,
+ };
+ 
+ bool is_cxl_cachedev(const struct device *dev)
+-- 
+2.51.1
+
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH 17/17] cxl/core: Add cache device cache management
+ attributes
+From: Ben Cheatham <Benjamin.Cheatham@amd.com>
+Date: Tue, 11 Nov 2025 15:40:32 -0600
+Message-Id: <20251111214032.8188-18-Benjamin.Cheatham@amd.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Add functions to cxl/core/pci.c to manage the cache of a CXL.cache
+enabled endpoint. Add these new functions to sysfs attributes for
+userspace accessibility.
+
+Signed-off-by: Ben Cheatham <Benjamin.Cheatham@amd.com>
+---
+ Documentation/ABI/testing/sysfs-bus-cxl | 31 +++++++++
+ drivers/cxl/core/cachedev.c             | 89 +++++++++++++++++++++++++
+ drivers/cxl/core/pci.c                  | 85 +++++++++++++++++++++++
+ drivers/cxl/cxlcache.h                  | 13 ++++
+ drivers/cxl/cxlpci.h                    |  6 ++
+ 5 files changed, 224 insertions(+)
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-cxl b/Documentation/ABI/testing/sysfs-bus-cxl
+index 6b4e8c7a963d..b7293a09dc93 100644
+--- a/Documentation/ABI/testing/sysfs-bus-cxl
++++ b/Documentation/ABI/testing/sysfs-bus-cxl
+@@ -615,3 +615,34 @@ Description:
+ 		The count is persistent across power loss and wraps back to 0
+ 		upon overflow. If this file is not present, the device does not
+ 		have the necessary support for dirty tracking.
++
++What:		/sys/bus/cxl/devices/cacheX/cache_disable
++Date:		Dec, 2025
++KernelVersion:	v6.19
++Contact:	linux-cxl@vger.kernel.org
++Description:
++		(RW) Reading this attribute returns whether the CXL cache of this
++		device is currently disabled. Writing a '1' to this attribute disables
++		the CXL cache of the device.
++
++What:		/sys/bus/cxl/devices/cacheX/cache_invalid
++Date:		Dec, 2025
++KernelVersion:	v6.19
++Contact:	linux-cxl@vger.kernel.org
++Description:
++		(RO) Whether the CXL cache of this device is currently invalid. Reading
++		this attribute while caching is enabled will always return 0. See the
++		"cache_disable" attribute for disabling caching.
++
++What:		/sys/bus/cxl/devices/cacheX/initiate_wbinvd
++Date:		Dec, 2025
++KernelVersion:	v6.19
++Contact:	linux-cxl@vger.kernel.org
++Description:
++		(WO) Writes to this attribute initiate an attempt to writeback and
++		invalidate this device's CXL cache. Writing to this attribute while
++		caching is enabled will result in a failure, see the "cache_disable"
++		attribute for disabling caching. The writeback and invalidate may take
++		some time to finish depending on the device. The result of this
++		operation can be found by reading the "cache_invalid" attribute of the
++		device.
+diff --git a/drivers/cxl/core/cachedev.c b/drivers/cxl/core/cachedev.c
+index d8bf18ec0579..2a6a3e4f6a17 100644
+--- a/drivers/cxl/core/cachedev.c
++++ b/drivers/cxl/core/cachedev.c
+@@ -6,6 +6,7 @@
+ #include "cxlpci.h"
+ 
+ #include "../cxlcache.h"
++#include "../cxlpci.h"
+ #include "private.h"
+ 
+ static DEFINE_IDA(cxl_cachedev_ida);
+@@ -110,9 +111,97 @@ static struct attribute_group cxl_cachedev_cache_attribute_group = {
+ 	.is_visible = cxl_cachedev_cache_visible,
+ };
+ 
++static ssize_t cache_disable_store(struct device *dev,
++				   struct device_attribute *attr,
++				   const char *buf, size_t n)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	bool disable;
++	int rc;
++
++	rc = kstrtobool(buf, &disable);
++	if (rc)
++		return rc;
++
++	rc = cxl_accel_set_cache_disable(cxlds, disable);
++	if (rc < 0)
++		return rc;
++
++	return n;
++}
++
++static ssize_t cache_disable_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++
++	return sysfs_emit(buf, "%d\n", cxl_accel_caching_disabled(cxlds));
++}
++static DEVICE_ATTR_RW(cache_disable);
++
++static ssize_t cache_invalid_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++
++	return sysfs_emit(buf, "%d\n", cxl_accel_cache_invalid(cxlds));
++}
++static DEVICE_ATTR_RO(cache_invalid);
++
++static ssize_t init_wbinvd_store(struct device *dev,
++				 struct device_attribute *attr, const char *buf,
++				 size_t n)
++{
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	int rc;
++
++	rc = cxl_accel_initiate_wbinvd(cxlds);
++	return rc ? rc : n;
++}
++static DEVICE_ATTR_WO(init_wbinvd);
++
++static struct attribute *cxl_cachedev_mgmt_attributes[] = {
++	&dev_attr_cache_disable.attr,
++	&dev_attr_cache_invalid.attr,
++	&dev_attr_init_wbinvd.attr,
++	NULL
++};
++
++static umode_t cxl_cachedev_mgmt_visible(struct kobject *kobj,
++					 struct attribute *a, int n)
++{
++	struct device *dev = kobj_to_dev(kobj);
++	struct cxl_cachedev *cxlcd = to_cxl_cachedev(dev);
++	struct cxl_dev_state *cxlds = cxlcd->cxlds;
++	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
++	u16 cap;
++	int rc;
++
++	rc = pci_read_config_word(pdev, cxlds->cxl_dvsec + CXL_DVSEC_CAP_OFFSET,
++				  &cap);
++	if (rc)
++		return 0;
++
++	if (!(cap & CXL_DVSEC_WBINVD_CAPABLE) &&
++	    a == &dev_attr_init_wbinvd.attr)
++		return 0;
++
++	return a->mode;
++}
++
++static struct attribute_group cxl_cachedev_mgmt_attribute_group = {
++	.attrs = cxl_cachedev_mgmt_attributes,
++	.is_visible = cxl_cachedev_mgmt_visible,
++};
++
+ static const struct attribute_group *cxl_cachedev_attribute_groups[] = {
+ 	&cxl_cachedev_attribute_group,
+ 	&cxl_cachedev_cache_attribute_group,
++	&cxl_cachedev_mgmt_attribute_group,
+ 	NULL
+ };
+ 
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 27c74e90ade5..a1bd7778aaff 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -1313,3 +1313,88 @@ int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds, bool hdmd)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_accel_read_cache_info, "CXL");
++
++bool cxl_accel_caching_disabled(struct cxl_dev_state *cxlds)
++{
++	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
++	int dvsec, rc;
++	u16 ctrl2;
++
++	if (!dev_is_pci(cxlds->dev))
++		return false;
++
++	dvsec = cxlds->cxl_dvsec;
++	rc = pci_read_config_word(pdev, dvsec + CXL_DVSEC_CTRL2_OFFSET, &ctrl2);
++	if (rc)
++		return false;
++
++	return FIELD_GET(CXL_DVSEC_DISABLE_CACHING, ctrl2);
++}
++
++int cxl_accel_set_cache_disable(struct cxl_dev_state *cxlds, bool disable)
++{
++	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
++	int dvsec, rc;
++	u16 ctrl2;
++
++	if (!dev_is_pci(cxlds->dev))
++		return -EINVAL;
++
++	guard(device)(cxlds->dev);
++	dvsec = cxlds->cxl_dvsec;
++	rc = pci_read_config_word(pdev, dvsec + CXL_DVSEC_CTRL2_OFFSET, &ctrl2);
++	if (rc)
++		return rc;
++
++	if (FIELD_GET(CXL_DVSEC_DISABLE_CACHING, ctrl2) == disable)
++		return 1;
++
++	ctrl2 &= ~CXL_DVSEC_DISABLE_CACHING;
++	ctrl2 |= FIELD_PREP(CXL_DVSEC_DISABLE_CACHING, disable);
++	return pci_write_config_word(pdev, dvsec + CXL_DVSEC_DISABLE_CACHING,
++				     ctrl2);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_accel_set_cache_disable, "CXL");
++
++int cxl_accel_initiate_wbinvd(struct cxl_dev_state *cxlds)
++{
++	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
++	int dvsec, rc;
++	u16 ctrl2;
++
++	if (!dev_is_pci(cxlds->dev))
++		return -EINVAL;
++
++	guard(device)(cxlds->dev);
++	if (cxl_accel_caching_disabled(cxlds) != 1)
++		return -EBUSY;
++
++	dvsec = cxlds->cxl_dvsec;
++	rc = pci_read_config_word(pdev, dvsec + CXL_DVSEC_CTRL2_OFFSET, &ctrl2);
++	if (rc)
++		return rc;
++
++	ctrl2 |= CXL_DVSEC_INIT_WBINVD;
++	return pci_write_config_word(pdev, dvsec + CXL_DVSEC_CTRL2_OFFSET,
++				     ctrl2);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_accel_initiate_wbinvd, "CXL");
++
++bool cxl_accel_cache_invalid(struct cxl_dev_state *cxlds)
++{
++	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
++	int dvsec, rc;
++	u16 stat2;
++
++	if (!dev_is_pci(cxlds->dev))
++		return false;
++
++	guard(device)(cxlds->dev);
++	dvsec = cxlds->cxl_dvsec;
++	rc = pci_read_config_word(pdev, dvsec + CXL_DVSEC_STAT2_OFFSET, &stat2);
++	if (rc)
++		return false;
++
++	return FIELD_GET(CXL_DVSEC_CACHE_INVALID, stat2);
++}
++EXPORT_SYMBOL_NS_GPL(cxl_accel_cache_invalid, "CXL");
+diff --git a/drivers/cxl/cxlcache.h b/drivers/cxl/cxlcache.h
+index fe9e44fda641..b62c5269507c 100644
+--- a/drivers/cxl/cxlcache.h
++++ b/drivers/cxl/cxlcache.h
+@@ -32,4 +32,17 @@ int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds, bool hdmd);
+ struct cxl_cachedev *devm_cxl_add_cachedev(struct device *host,
+ 					   struct cxl_dev_state *cxlds);
+ bool cxl_cachedev_is_type2(struct cxl_cachedev *cxlcd);
++
++int devm_cxl_snoop_filter_alloc(u32 gid, struct cxl_dev_state *cxlds);
++
++int devm_cxl_port_program_cache_idrt(struct cxl_port *port,
++				     struct cxl_dport *dport,
++				     struct cxl_cachedev *cxlcd);
++int cxl_dport_program_cache_idd(struct cxl_dport *dport,
++				struct cxl_cachedev *cxlcd);
++
++int cxl_accel_set_cache_disable(struct cxl_dev_state *cxlds, bool disable);
++bool cxl_accel_caching_disabled(struct cxl_dev_state *cxlds);
++bool cxl_accel_cache_invalid(struct cxl_dev_state *cxlds);
++int cxl_accel_initiate_wbinvd(struct cxl_dev_state *cxlds);
+ #endif
+diff --git a/drivers/cxl/cxlpci.h b/drivers/cxl/cxlpci.h
+index 18230e4f677c..a63bba3ab348 100644
+--- a/drivers/cxl/cxlpci.h
++++ b/drivers/cxl/cxlpci.h
+@@ -20,8 +20,14 @@
+ #define     CXL_DVSEC_CACHE_CAPABLE	BIT(0)
+ #define     CXL_DVSEC_MEM_CAPABLE	BIT(2)
+ #define     CXL_DVSEC_HDM_COUNT_MASK	GENMASK(5, 4)
++#define     CXL_DVSEC_WBINVD_CAPABLE	BIT(6)
+ #define   CXL_DVSEC_CTRL_OFFSET		0xC
+ #define     CXL_DVSEC_MEM_ENABLE	BIT(2)
++#define   CXL_DVSEC_CTRL2_OFFSET	0x10
++#define     CXL_DVSEC_DISABLE_CACHING	BIT(0)
++#define     CXL_DVSEC_INIT_WBINVD	BIT(1)
++#define   CXL_DVSEC_STAT2_OFFSET	0x12
++#define     CXL_DVSEC_CACHE_INVALID	BIT(0)
+ #define   CXL_DVSEC_CAP2_OFFSET		0x16
+ #define     CXL_DVSEC_CACHE_UNIT_MASK	GENMASK(3, 0)
+ #define     CXL_DVSEC_CACHE_SIZE_MASK	GENMASK(15, 8)
+-- 
+2.51.1
+

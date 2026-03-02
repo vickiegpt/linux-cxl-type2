@@ -1,0 +1,50 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef __CXL_CACHE_H__
+#define __CXL_CACHE_H__
+#include "cxl.h"
+
+/**
+ * struct cxl_cachedev - CXL bus object representing a cache-capable CXL device
+ * @dev: driver core device object
+ * @cdev: character device for /dev/cxl/cache* access
+ * @cxlds: device state backing this device
+ * @endpoint: connection to the CXL port topology for this device
+ * @ops: caller specific probe routine
+ * @id: id number of this cachedev instance
+ * @depth: endpoint port depth in hierarchy
+ */
+struct cxl_cachedev {
+	struct device dev;
+	struct cdev cdev;
+	struct cxl_dev_state *cxlds;
+	struct cxl_port *endpoint;
+	const struct cxl_dev_ops *ops;
+	int id;
+	int depth;
+};
+
+static inline struct cxl_cachedev *to_cxl_cachedev(struct device *dev)
+{
+	return container_of(dev, struct cxl_cachedev, dev);
+}
+
+bool is_cxl_cachedev(const struct device *dev);
+
+int cxl_accel_read_cache_info(struct cxl_dev_state *cxlds, bool hdmd);
+struct cxl_cachedev *devm_cxl_add_cachedev(struct device *host,
+					   struct cxl_dev_state *cxlds);
+bool cxl_cachedev_is_type2(struct cxl_cachedev *cxlcd);
+
+int devm_cxl_snoop_filter_alloc(u32 gid, struct cxl_dev_state *cxlds);
+
+int devm_cxl_port_program_cache_idrt(struct cxl_port *port,
+				     struct cxl_dport *dport,
+				     struct cxl_cachedev *cxlcd);
+int cxl_dport_program_cache_idd(struct cxl_dport *dport,
+				struct cxl_cachedev *cxlcd);
+
+int cxl_accel_set_cache_disable(struct cxl_dev_state *cxlds, bool disable);
+bool cxl_accel_caching_disabled(struct cxl_dev_state *cxlds);
+bool cxl_accel_cache_invalid(struct cxl_dev_state *cxlds);
+int cxl_accel_initiate_wbinvd(struct cxl_dev_state *cxlds);
+#endif
