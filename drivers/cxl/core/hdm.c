@@ -103,7 +103,7 @@ static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
 	hdm = cxlhdm->regs.hdm_decoder;
 
 	if (!hdm)
-		return true;
+		return info->ranges > 0;
 
 	/*
 	 * If HDM decoders are present and the driver is in control of
@@ -164,6 +164,20 @@ static struct cxl_hdm *devm_cxl_setup_hdm(struct cxl_port *port,
 		}
 
 		cxlhdm->decoder_count = info->ranges;
+		/*
+		 * Type 2 accelerators may not have firmware-programmed
+		 * DVSEC ranges (base/size = 0) but still support HDM
+		 * decoders. Use the DVSEC HDM count to create empty
+		 * endpoint decoders that can be configured by userspace.
+		 */
+		if (!cxlhdm->decoder_count && info->hdm_count)
+			cxlhdm->decoder_count = info->hdm_count;
+		/*
+		 * Without HDM decoder registers, set permissive
+		 * interleave capabilities for endpoint decoders.
+		 */
+		cxlhdm->iw_cap_mask = BIT(1) | BIT(2) | BIT(4) | BIT(8);
+		cxlhdm->interleave_mask = ~0U;
 		return cxlhdm;
 	}
 
@@ -808,6 +822,51 @@ static void setup_hw_decoder(struct cxl_decoder *cxld, void __iomem *hdm)
 	writel(ctrl, hdm + CXL_HDM_DECODER0_CTRL_OFFSET(id));
 }
 
+/*
+ * Software-only commit for decoders without HDM registers (e.g. Type 2
+ * accelerators using DVSEC range emulation with unprogrammed ranges).
+ */
+static int cxl_decoder_commit_soft(struct cxl_decoder *cxld)
+{
+	struct cxl_port *port = to_cxl_port(cxld->dev.parent);
+
+	if (cxld->flags & CXL_DECODER_F_ENABLE)
+		return 0;
+
+	if (cxl_num_decoders_committed(port) != cxld->id) {
+		dev_dbg(&port->dev,
+			"%s: out of order commit, expected decoder%d.%d\n",
+			dev_name(&cxld->dev), port->id,
+			cxl_num_decoders_committed(port));
+		return -EBUSY;
+	}
+
+	port->commit_end++;
+	cxld->flags |= CXL_DECODER_F_ENABLE;
+
+	return 0;
+}
+
+static void cxl_decoder_reset_soft(struct cxl_decoder *cxld)
+{
+	struct cxl_port *port = to_cxl_port(cxld->dev.parent);
+
+	if ((cxld->flags & CXL_DECODER_F_ENABLE) == 0)
+		return;
+
+	if (port->commit_end == cxld->id)
+		cxl_port_commit_reap(cxld);
+
+	cxld->flags &= ~CXL_DECODER_F_ENABLE;
+
+	if (is_endpoint_decoder(&cxld->dev)) {
+		struct cxl_endpoint_decoder *cxled;
+
+		cxled = to_cxl_endpoint_decoder(&cxld->dev);
+		cxled->state = CXL_DECODER_STATE_MANUAL;
+	}
+}
+
 static int cxl_decoder_commit(struct cxl_decoder *cxld)
 {
 	struct cxl_port *port = to_cxl_port(cxld->dev.parent);
@@ -998,6 +1057,37 @@ static int init_hdm_decoder(struct cxl_port *port, struct cxl_decoder *cxld,
 	if (should_emulate_decoders(info))
 		return cxl_setup_hdm_decoder_from_dvsec(port, cxld, dpa_base,
 							which, info);
+
+	/*
+	 * No HDM decoder registers and no DVSEC ranges to emulate.
+	 * Create an empty endpoint decoder in manual state that
+	 * userspace can configure via sysfs (mode, dpa_size, etc.).
+	 * This is the typical path for Type 2 accelerators where
+	 * firmware does not program DVSEC range registers.
+	 */
+	if (!hdm) {
+		if (info && is_cxl_endpoint(port)) {
+			struct cxl_endpoint_decoder *cxled;
+			struct cxl_memdev *cxlmd;
+			struct cxl_dev_state *cxlds;
+
+			cxled = to_cxl_endpoint_decoder(&cxld->dev);
+			cxlmd = cxled_to_memdev(cxled);
+			cxlds = cxlmd->cxlds;
+
+			cxld->hpa_range = (struct range){ .start = 0,
+							  .end = -1 };
+			if (cxlds->type == CXL_DEVTYPE_CLASSMEM)
+				cxld->target_type = CXL_DECODER_HOSTONLYMEM;
+			else
+				cxld->target_type = CXL_DECODER_DEVMEM;
+			cxld->commit = cxl_decoder_commit_soft;
+			cxld->reset = cxl_decoder_reset_soft;
+			cxled->state = CXL_DECODER_STATE_MANUAL;
+			return 0;
+		}
+		return -ENODEV;
+	}
 
 	ctrl = readl(hdm + CXL_HDM_DECODER0_CTRL_OFFSET(which));
 	lo = readl(hdm + CXL_HDM_DECODER0_BASE_LOW_OFFSET(which));

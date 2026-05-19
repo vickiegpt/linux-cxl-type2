@@ -742,7 +742,13 @@ static struct cxl_port *cxl_port_alloc(struct device *uport_dev,
 			iter = to_cxl_port(iter->dev.parent);
 		if (iter->host_bridge)
 			port->host_bridge = iter->host_bridge;
-		else if (parent_dport->rch)
+		else if (parent_dport->rch ||
+			 is_cxl_root(to_cxl_port(dev->parent)))
+			/*
+			 * RCH endpoints, or endpoints directly under root
+			 * (e.g. RCH devices aliased under VH dport), use
+			 * the dport device as the host bridge reference.
+			 */
 			port->host_bridge = parent_dport->dport_dev;
 		else
 			port->host_bridge = iter->uport_dev;

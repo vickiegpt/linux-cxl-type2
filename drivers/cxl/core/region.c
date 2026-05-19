@@ -2659,7 +2659,8 @@ static struct cxl_region *__create_region(struct cxl_root_decoder *cxlrd,
 		return ERR_PTR(-EBUSY);
 	}
 
-	return devm_cxl_add_region(cxlrd, id, mode, CXL_DECODER_HOSTONLYMEM);
+	return devm_cxl_add_region(cxlrd, id, mode,
+				   cxlrd->cxlsd.cxld.target_type);
 }
 
 static ssize_t create_region_store(struct device *dev, const char *buf,
@@ -3480,6 +3481,26 @@ cxl_port_find_switch_decoder(struct cxl_port *port, struct range *hpa)
 	return cxld_dev ? to_cxl_decoder(cxld_dev) : NULL;
 }
 
+struct match_decoder_ctx {
+	struct range *hpa;
+	enum cxl_decoder_type target_type;
+};
+
+static int match_decoder_by_range_and_type(struct device *dev, const void *data)
+{
+	const struct match_decoder_ctx *ctx = data;
+	struct cxl_decoder *cxld;
+	const struct range *r1;
+
+	if (!is_switch_decoder(dev))
+		return 0;
+
+	cxld = to_cxl_decoder(dev);
+	r1 = &cxld->hpa_range;
+	return range_contains(r1, ctx->hpa) &&
+	       cxld->target_type == ctx->target_type;
+}
+
 static struct cxl_root_decoder *
 cxl_find_root_decoder(struct cxl_endpoint_decoder *cxled)
 {
@@ -3488,7 +3509,19 @@ cxl_find_root_decoder(struct cxl_endpoint_decoder *cxled)
 	struct cxl_root *cxl_root __free(put_cxl_root) = find_cxl_root(port);
 	struct cxl_decoder *root, *cxld = &cxled->cxld;
 	struct range *hpa = &cxld->hpa_range;
+	struct device *cxld_dev;
 
+	/* Prefer a root decoder matching the endpoint's target type */
+	struct match_decoder_ctx ctx = {
+		.hpa = hpa,
+		.target_type = cxld->target_type,
+	};
+	cxld_dev = device_find_child(&cxl_root->port.dev, &ctx,
+				     match_decoder_by_range_and_type);
+	if (cxld_dev)
+		return to_cxl_root_decoder(cxld_dev);
+
+	/* Fall back to any decoder covering the range */
 	root = cxl_port_find_switch_decoder(&cxl_root->port, hpa);
 	if (!root) {
 		dev_err(cxlmd->dev.parent,

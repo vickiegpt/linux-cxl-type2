@@ -358,6 +358,7 @@ int cxl_dvsec_rr_decode(struct cxl_dev_state *cxlds,
 	}
 
 	info->ranges = ranges;
+	info->hdm_count = hdm_count;
 
 	return 0;
 }

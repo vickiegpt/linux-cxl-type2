@@ -93,7 +93,7 @@ static int cxl_cache_probe(struct device *dev)
 		return -ENXIO;
 	}
 
-	if (dport->rch)
+	if (dport->rch || cxlds->rcd)
 		endpoint_parent = parent_port->uport_dev;
 	else
 		endpoint_parent = &parent_port->dev;
