@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <emmintrin.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -254,6 +255,84 @@ static int read_dax_size(const char *dax_path, uint64_t *size_out)
 	}
 	*size_out = parse_u64(line, "dax size");
 	return 0;
+}
+
+/*
+ * Bit layout of one instruction word (mirrors kernel tmatmul_encode_instr).
+ *
+ *   word[0] = addr (little-endian)
+ *   word[1] = bits[2:0]=rms, [4:3]=tm, [6:5]=ls,
+ *             [9:7]=va,  [12:10]=vb, [15:13]=vy,
+ *             [19:16]=op, [22:20]=fu
+ */
+static void encode_instr(uint8_t *dst, uint32_t fu, uint32_t op,
+			 uint32_t vy, uint32_t vb, uint32_t va,
+			 uint32_t ls, uint32_t tm, uint32_t rms,
+			 uint64_t addr)
+{
+	uint64_t hi = 0;
+	hi |= (uint64_t)(rms & 0x7);
+	hi |= (uint64_t)(tm  & 0x3) << 3;
+	hi |= (uint64_t)(ls  & 0x3) << 5;
+	hi |= (uint64_t)(va  & 0x7) << 7;
+	hi |= (uint64_t)(vb  & 0x7) << 10;
+	hi |= (uint64_t)(vy  & 0x7) << 13;
+	hi |= (uint64_t)(op  & 0xf) << 16;
+	hi |= (uint64_t)(fu  & 0x7) << 20;
+
+	uint64_t addr_le = htole64(addr);
+	uint64_t hi_le   = htole64(hi);
+	memcpy(dst + 0, &addr_le, 8);
+	memcpy(dst + 8, &hi_le,   8);
+}
+
+static void encode_smoke_program(uint8_t prog[TMATMUL_PROGRAM_BYTES])
+{
+	encode_instr(prog + 0 * 16, 0x1, 0, 0, 0, 0, 0x1, 0, 0,
+		     TMATMUL_DPA_INPUT);
+	encode_instr(prog + 1 * 16, 0x3, 0, 0, 0, 0, 0,   0x1, 0, 0);
+	encode_instr(prog + 2 * 16, 0x3, 0, 0, 0, 0, 0,   0x2, 0,
+		     TMATMUL_DPA_MATRIX);
+	encode_instr(prog + 3 * 16, 0x3, 0, 1, 1, 1, 0,   0x3, 0, 0);
+	encode_instr(prog + 4 * 16, 0x1, 0, 1, 1, 1, 0x2, 0,   0,
+		     TMATMUL_DPA_OUTPUT);
+	encode_instr(prog + 5 * 16, 0x5, 0, 0, 0, 0, 0,   0,   0, 0);
+}
+
+static void fill_input_vector(uint8_t *base, uint32_t dim_d)
+{
+	uint16_t v = (uint16_t)htole16(INPUT_Q88_ONE);
+	uint16_t *vec = (uint16_t *)base;
+	for (uint32_t i = 0; i < dim_d; i++)
+		vec[i] = v;
+}
+
+/* Evict the touched cachelines so the device will see the writes when it
+ * fetches from CXL.mem.  Range is [start, start+len), aligned externally
+ * to 64-byte boundaries by the caller.
+ */
+static void flush_range(volatile void *start, size_t len)
+{
+	const size_t LINE = 64;
+	uintptr_t a = (uintptr_t)start & ~(LINE - 1);
+	uintptr_t end = ((uintptr_t)start + len + LINE - 1) & ~(LINE - 1);
+	for (; a < end; a += LINE)
+		_mm_clflush((const void *)a);
+	_mm_sfence();
+}
+
+/* Counterpart to flush_range for reads: clflush evicts any cached copy of
+ * the line, so the next load comes from device memory.  lfence orders the
+ * subsequent loads after the flush.
+ */
+static void invalidate_range(volatile void *start, size_t len)
+{
+	const size_t LINE = 64;
+	uintptr_t a = (uintptr_t)start & ~(LINE - 1);
+	uintptr_t end = ((uintptr_t)start + len + LINE - 1) & ~(LINE - 1);
+	for (; a < end; a += LINE)
+		_mm_clflush((const void *)a);
+	_mm_lfence();
 }
 
 static const char *short_bdf(const char *bdf)
