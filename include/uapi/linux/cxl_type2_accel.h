@@ -5,19 +5,16 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define CXL_TYPE2_TMATMUL_UAPI_VERSION	1
+#define CXL_TYPE2_TMATMUL_UAPI_VERSION	2
 
 /*
- * Run the built-in smoke program:
- *   ldv input -> tmatmul import -> tmatmul go -> export -> sv output -> stall
+ * Result flags returned by CXL_TYPE2_TMATMUL_RUN_CSR_ONLY.
  *
- * The driver writes a zero ternary matrix, a fixed-point 1.0 input vector, and
- * an output sentinel into CXL.mem before launching the instruction stream.
+ * STALLED is the success indicator: the device reached the trailing 'stall'
+ * instruction of the user-provided program.  Userspace verifies the output
+ * region of its own mmap to confirm the result.
  */
-#define CXL_TYPE2_TMATMUL_RUN_SMOKE		(1U << 0)
-
 #define CXL_TYPE2_TMATMUL_RESULT_STALLED	(1U << 0)
-#define CXL_TYPE2_TMATMUL_RESULT_OUTPUT_ZERO	(1U << 1)
 #define CXL_TYPE2_TMATMUL_RESULT_DMA_ERROR	(1U << 2)
 
 struct cxl_type2_tmatmul_info {
@@ -28,19 +25,16 @@ struct cxl_type2_tmatmul_info {
 	__u32 ddr_data_width;
 	__u32 mc_status;
 	__u32 reserved0;
-	__u64 default_hpa_base;
-	__u64 default_hpa_size;
-	__u64 reserved1[4];
+	__u64 reserved1[2];	/* was default_hpa_base/_size in v1 */
+	__u64 reserved2[4];
 };
 
-struct cxl_type2_tmatmul_run {
-	/* Inputs. hpa_base/hpa_size may be zero to use module defaults. */
-	__u64 hpa_base;
-	__u64 hpa_size;
+struct cxl_type2_tmatmul_csr_run {
+	/* in */
 	__u32 timeout_ms;
-	__u32 flags;
+	__u32 flags;		/* reserved, must be 0 */
 
-	/* Outputs, updated even when the ioctl returns an error. */
+	/* out (updated on both success and error) */
 	__u32 dma_status;
 	__u32 stall_status;
 	__u32 instr_count;
@@ -53,7 +47,8 @@ struct cxl_type2_tmatmul_run {
 #define CXL_TYPE2_TMATMUL_IOC_MAGIC		0xCE
 #define CXL_TYPE2_TMATMUL_GET_INFO		\
 	_IOR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x00, struct cxl_type2_tmatmul_info)
-#define CXL_TYPE2_TMATMUL_RUN			\
-	_IOWR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x01, struct cxl_type2_tmatmul_run)
+/* ioctl 0x01 was CXL_TYPE2_TMATMUL_RUN in v1; retired with no replacement. */
+#define CXL_TYPE2_TMATMUL_RUN_CSR_ONLY		\
+	_IOWR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x02, struct cxl_type2_tmatmul_csr_run)
 
 #endif /* _UAPI_LINUX_CXL_TYPE2_ACCEL_H */
