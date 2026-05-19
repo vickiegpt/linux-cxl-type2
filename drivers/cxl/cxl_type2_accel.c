@@ -18,7 +18,6 @@
 #include <linux/sizes.h>
 #include <linux/uaccess.h>
 #include <uapi/linux/cxl_type2_accel.h>
-#include <asm/cacheflush.h>
 
 #include "cxlmem.h"
 #include "cxlpci.h"
@@ -55,33 +54,19 @@
 #define TMATMUL_DMA_DONE		0x02
 #define TMATMUL_DMA_ERROR		0xFF
 
-#define TMATMUL_DDR_MATRIX_ADDR		0x00000000ULL
-#define TMATMUL_DDR_INPUT_ADDR		0x00100000ULL
-#define TMATMUL_DDR_OUTPUT_ADDR		0x00200000ULL
-#define TMATMUL_DDR_INSTR_ADDR		0x00300000ULL
-
+/*
+ * Userspace places its instruction program at this device-physical-address
+ * offset within the dax window.  The driver only needs to point the CSR
+ * fetch engine at it; the actual bytes are written by userspace.
+ */
+#define TMATMUL_DDR_INSTR_DPA		0x00300000ULL
 #define TMATMUL_PROGRAM_BYTES		(6 * 16)
-#define TMATMUL_MAX_MATRIX_BYTES	(64ULL * SZ_1M)
-#define TMATMUL_UNCACHED_MEMREMAP_FLAGS	(MEMREMAP_WT | MEMREMAP_WC)
-#define TMATMUL_WB_MEMREMAP_FLAGS	MEMREMAP_WB
-
-static u64 tmatmul_hpa_base;
-module_param(tmatmul_hpa_base, ullong, 0644);
-MODULE_PARM_DESC(tmatmul_hpa_base,
-	"Default CXL.mem host physical base for tmatmul ioctls");
-
-static u64 tmatmul_hpa_size = 16ULL * SZ_1G;
-module_param(tmatmul_hpa_size, ullong, 0644);
-MODULE_PARM_DESC(tmatmul_hpa_size,
-	"Default CXL.mem host physical window size for tmatmul ioctls");
 
 struct cxl_type2_tmatmul_dev {
 	struct pci_dev *pdev;
 	void __iomem *csr;
 	struct miscdevice miscdev;
 	struct mutex lock;
-	u64 default_hpa_base;
-	u64 default_hpa_size;
 };
 
 static u32 tmatmul_rd32(struct cxl_type2_tmatmul_dev *tmatmul, u32 off)
@@ -99,251 +84,33 @@ static u32 tmatmul_inst_off(u32 inst, u32 off)
 	return TMATMUL_INSTANCE_BASE + inst * TMATMUL_INSTANCE_STRIDE + off;
 }
 
-static bool tmatmul_range_ok(u64 hpa_base, u64 hpa_size, u64 off, u64 len)
-{
-	if (!hpa_base || !hpa_size || !len)
-		return false;
-	if (off > hpa_size || len > hpa_size - off)
-		return false;
-	if (hpa_base + off < hpa_base)
-		return false;
-	if (hpa_base + off + len < hpa_base + off)
-		return false;
-	return true;
-}
-
-static void *tmatmul_memremap(u64 hpa_base, u64 hpa_size, u64 off, size_t len,
-			      bool *needs_flush)
-{
-	void *addr;
-
-	if (!tmatmul_range_ok(hpa_base, hpa_size, off, len))
-		return NULL;
-
-	if (needs_flush)
-		*needs_flush = false;
-
-	addr = memremap(hpa_base + off, len, TMATMUL_UNCACHED_MEMREMAP_FLAGS);
-	if (addr)
-		return addr;
-
-	addr = memremap(hpa_base + off, len, TMATMUL_WB_MEMREMAP_FLAGS);
-	if (addr && needs_flush)
-		*needs_flush = true;
-	return addr;
-}
-
-static void tmatmul_flush_mapping(void *addr, size_t len, bool needs_flush)
-{
-	if (needs_flush)
-		clflush_cache_range(addr, len);
-}
-
-static int tmatmul_zero_hpa(u64 hpa_base, u64 hpa_size, u64 off, size_t len)
-{
-	void *addr;
-	bool needs_flush;
-
-	addr = tmatmul_memremap(hpa_base, hpa_size, off, len, &needs_flush);
-	if (!addr)
-		return -ENOMEM;
-
-	memset(addr, 0, len);
-	wmb();
-	tmatmul_flush_mapping(addr, len, needs_flush);
-	wmb();
-	memunmap(addr);
-	return 0;
-}
-
-static int tmatmul_pattern_hpa(u64 hpa_base, u64 hpa_size, u64 off,
-			       size_t len, u8 pattern)
-{
-	void *addr;
-	bool needs_flush;
-
-	addr = tmatmul_memremap(hpa_base, hpa_size, off, len, &needs_flush);
-	if (!addr)
-		return -ENOMEM;
-
-	memset(addr, pattern, len);
-	wmb();
-	tmatmul_flush_mapping(addr, len, needs_flush);
-	wmb();
-	memunmap(addr);
-	return 0;
-}
-
-static int tmatmul_write_hpa(u64 hpa_base, u64 hpa_size, u64 off,
-			     const void *src, size_t len)
-{
-	void *addr;
-	bool needs_flush;
-
-	addr = tmatmul_memremap(hpa_base, hpa_size, off, len, &needs_flush);
-	if (!addr)
-		return -ENOMEM;
-
-	memcpy(addr, src, len);
-	wmb();
-	tmatmul_flush_mapping(addr, len, needs_flush);
-	wmb();
-	memunmap(addr);
-	return 0;
-}
-
-static int tmatmul_fill_input_vector(u64 hpa_base, u64 hpa_size, u64 off,
-				     u32 dim_d)
-{
-	__le16 *vec;
-	u32 i;
-	size_t len = dim_d * sizeof(*vec);
-	bool needs_flush;
-
-	vec = tmatmul_memremap(hpa_base, hpa_size, off, len, &needs_flush);
-	if (!vec)
-		return -ENOMEM;
-
-	for (i = 0; i < dim_d; i++)
-		vec[i] = cpu_to_le16(0x0100);
-
-	wmb();
-	tmatmul_flush_mapping(vec, len, needs_flush);
-	wmb();
-	memunmap(vec);
-	return 0;
-}
-
-static int tmatmul_output_is_zero(u64 hpa_base, u64 hpa_size, u64 off, size_t len)
-{
-	u8 *addr;
-	size_t i;
-	bool needs_flush;
-
-	addr = tmatmul_memremap(hpa_base, hpa_size, off, len, &needs_flush);
-	if (!addr)
-		return -ENOMEM;
-
-	tmatmul_flush_mapping(addr, len, needs_flush);
-	rmb();
-	rmb();
-	for (i = 0; i < len; i++) {
-		if (addr[i]) {
-			memunmap(addr);
-			return -EIO;
-		}
-	}
-
-	memunmap(addr);
-	return 0;
-}
-
-static void tmatmul_encode_instr(u8 *dst, u32 fu, u32 op, u32 vy, u32 vb,
-				 u32 va, u32 ls, u32 tm, u32 rms, u64 addr)
-{
-	__le64 *word = (__le64 *)dst;
-	u64 hi = 0;
-
-	hi |= (u64)(rms & 0x7);
-	hi |= (u64)(tm & 0x3) << 3;
-	hi |= (u64)(ls & 0x3) << 5;
-	hi |= (u64)(va & 0x7) << 7;
-	hi |= (u64)(vb & 0x7) << 10;
-	hi |= (u64)(vy & 0x7) << 13;
-	hi |= (u64)(op & 0xf) << 16;
-	hi |= (u64)(fu & 0x7) << 20;
-
-	word[0] = cpu_to_le64(addr);
-	word[1] = cpu_to_le64(hi);
-}
-
-static void tmatmul_build_smoke_program(u8 program[TMATMUL_PROGRAM_BYTES])
-{
-	u8 *p = program;
-
-	tmatmul_encode_instr(p + 0 * 16, 0x1, 0, 0, 0, 0, 0x1, 0, 0,
-			     TMATMUL_DDR_INPUT_ADDR);
-	tmatmul_encode_instr(p + 1 * 16, 0x3, 0, 0, 0, 0, 0, 0x1, 0, 0);
-	tmatmul_encode_instr(p + 2 * 16, 0x3, 0, 0, 0, 0, 0, 0x2, 0,
-			     TMATMUL_DDR_MATRIX_ADDR);
-	tmatmul_encode_instr(p + 3 * 16, 0x3, 0, 1, 1, 1, 0, 0x3, 0, 0);
-	tmatmul_encode_instr(p + 4 * 16, 0x1, 0, 1, 1, 1, 0x2, 0, 0,
-			     TMATMUL_DDR_OUTPUT_ADDR);
-	tmatmul_encode_instr(p + 5 * 16, 0x5, 0, 0, 0, 0, 0, 0, 0, 0);
-}
-
-static int tmatmul_upload_smoke_payload(u64 hpa_base, u64 hpa_size, u32 dim_d)
-{
-	u8 program[TMATMUL_PROGRAM_BYTES];
-	u64 matrix_len;
-	size_t vector_len;
-	int rc;
-
-	matrix_len = (u64)dim_d * dim_d / 4;
-	vector_len = dim_d * sizeof(__le16);
-	if (!dim_d || matrix_len > TMATMUL_MAX_MATRIX_BYTES)
-		return -EINVAL;
-
-	rc = tmatmul_zero_hpa(hpa_base, hpa_size, TMATMUL_DDR_MATRIX_ADDR,
-			      matrix_len);
-	if (rc)
-		return rc;
-
-	rc = tmatmul_fill_input_vector(hpa_base, hpa_size, TMATMUL_DDR_INPUT_ADDR,
-				       dim_d);
-	if (rc)
-		return rc;
-
-	rc = tmatmul_pattern_hpa(hpa_base, hpa_size, TMATMUL_DDR_OUTPUT_ADDR,
-				 vector_len, 0xa5);
-	if (rc)
-		return rc;
-
-	tmatmul_build_smoke_program(program);
-	return tmatmul_write_hpa(hpa_base, hpa_size, TMATMUL_DDR_INSTR_ADDR,
-				 program, sizeof(program));
-}
-
-static int tmatmul_launch_smoke(struct cxl_type2_tmatmul_dev *tmatmul,
-				struct cxl_type2_tmatmul_run *run)
+static int tmatmul_launch_csr_only(struct cxl_type2_tmatmul_dev *tmatmul,
+				   struct cxl_type2_tmatmul_csr_run *run)
 {
 	unsigned long deadline;
-	u64 hpa_base = run->hpa_base ?: tmatmul->default_hpa_base;
-	u64 hpa_size = run->hpa_size ?: tmatmul->default_hpa_size;
 	u32 timeout_ms = run->timeout_ms ?: 5000;
-	u32 dim_d, num_instances;
-	size_t output_len;
+	u32 num_instances;
 	int rc = 0;
 
-	if (!(run->flags & CXL_TYPE2_TMATMUL_RUN_SMOKE))
+	if (run->flags)
 		return -EINVAL;
 
 	num_instances = tmatmul_rd32(tmatmul, TMATMUL_REG_NUM_INSTANCES);
 	if (!num_instances)
 		return -ENODEV;
 
-	dim_d = tmatmul_rd32(tmatmul, TMATMUL_REG_DIM_D);
-	output_len = dim_d * sizeof(__le16);
-	run->dim_d = dim_d;
-
-	if (!tmatmul_range_ok(hpa_base, hpa_size, TMATMUL_DDR_OUTPUT_ADDR,
-			      output_len))
-		return -EINVAL;
+	run->dim_d = tmatmul_rd32(tmatmul, TMATMUL_REG_DIM_D);
 
 	mutex_lock(&tmatmul->lock);
-
-	rc = tmatmul_upload_smoke_payload(hpa_base, hpa_size, dim_d);
-	if (rc)
-		goto out_unlock;
 
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_STALL_CLEAR), 1);
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_RST_TRIGGER), 1);
 	msleep(50);
 
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_SRC_LO),
-		     lower_32_bits(TMATMUL_DDR_INSTR_ADDR));
+		     lower_32_bits(TMATMUL_DDR_INSTR_DPA));
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_SRC_HI),
-		     upper_32_bits(TMATMUL_DDR_INSTR_ADDR));
+		     upper_32_bits(TMATMUL_DDR_INSTR_DPA));
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_LEN),
 		     TMATMUL_PROGRAM_BYTES);
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_START), 1);
@@ -359,15 +126,8 @@ static int tmatmul_launch_smoke(struct cxl_type2_tmatmul_dev *tmatmul,
 
 		if (run->stall_status) {
 			run->result_flags |= CXL_TYPE2_TMATMUL_RESULT_STALLED;
-			rc = tmatmul_output_is_zero(hpa_base, hpa_size,
-						    TMATMUL_DDR_OUTPUT_ADDR,
-						    output_len);
-			if (!rc)
-				run->result_flags |=
-					CXL_TYPE2_TMATMUL_RESULT_OUTPUT_ZERO;
 			goto out_unlock;
 		}
-
 		if (run->dma_status == TMATMUL_DMA_ERROR) {
 			run->result_flags |= CXL_TYPE2_TMATMUL_RESULT_DMA_ERROR;
 			rc = -EIO;
@@ -392,7 +152,7 @@ static long cxl_type2_tmatmul_ioctl(struct file *file, unsigned int cmd,
 		container_of(miscdev, struct cxl_type2_tmatmul_dev, miscdev);
 	void __user *argp = (void __user *)arg;
 	struct cxl_type2_tmatmul_info info;
-	struct cxl_type2_tmatmul_run run;
+	struct cxl_type2_tmatmul_csr_run run;
 	int rc;
 
 	switch (cmd) {
@@ -406,20 +166,19 @@ static long cxl_type2_tmatmul_ioctl(struct file *file, unsigned int cmd,
 		info.ddr_data_width = tmatmul_rd32(tmatmul,
 						   TMATMUL_REG_DDR_DATA_WIDTH);
 		info.mc_status = tmatmul_rd32(tmatmul, TMATMUL_REG_MC_STATUS);
-		info.default_hpa_base = tmatmul->default_hpa_base;
-		info.default_hpa_size = tmatmul->default_hpa_size;
 		if (copy_to_user(argp, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
 
-	case CXL_TYPE2_TMATMUL_RUN:
+	case CXL_TYPE2_TMATMUL_RUN_CSR_ONLY:
 		if (copy_from_user(&run, argp, sizeof(run)))
 			return -EFAULT;
 		run.dma_status = 0;
 		run.stall_status = 0;
 		run.instr_count = 0;
+		run.dim_d = 0;
 		run.result_flags = 0;
-		rc = tmatmul_launch_smoke(tmatmul, &run);
+		rc = tmatmul_launch_csr_only(tmatmul, &run);
 		if (copy_to_user(argp, &run, sizeof(run)))
 			return -EFAULT;
 		return rc;
@@ -475,8 +234,6 @@ static int cxl_type2_tmatmul_init(struct pci_dev *pdev)
 	}
 
 	mutex_init(&tmatmul->lock);
-	tmatmul->default_hpa_base = tmatmul_hpa_base;
-	tmatmul->default_hpa_size = tmatmul_hpa_size;
 
 	name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "cxl_tmatmul%02x%02x%x",
 			      pdev->bus->number, PCI_SLOT(pdev->devfn),
@@ -503,9 +260,8 @@ static int cxl_type2_tmatmul_init(struct pci_dev *pdev)
 		return rc;
 
 	dev_info(&pdev->dev,
-		 "tmatmul ready: /dev/%s CSR=BAR0+0x%x hpa_base=0x%llx hpa_size=0x%llx\n",
-		 name, TMATMUL_CSR_BASE, tmatmul->default_hpa_base,
-		 tmatmul->default_hpa_size);
+		 "tmatmul ready: /dev/%s CSR=BAR0+0x%x\n",
+		 name, TMATMUL_CSR_BASE);
 	return 0;
 }
 
@@ -527,6 +283,43 @@ static int cxl_type2_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
 		return rc;
 
 	return cxl_setup_regs(map);
+}
+
+/*
+ * IA-780I splits the Type-2 device across two functions: PF0 carries the
+ * host-facing CXL stack plus the tmatmul CSRs in BAR0, and PF1 carries the AFU
+ * data path including the CXL.mem responder.  This driver only binds PF0, but
+ * the AFU on PF1 must have Memory Space + Bus Master enabled before the device
+ * will acknowledge CXL.mem traffic to the HPA range advertised by the HDM
+ * decoder.  Without PF1 enabled, userspace writes to the devdax mmap land on
+ * an inert responder; on this platform that surfaces as an uncorrectable
+ * error and brings the host down rather than returning an I/O error.
+ * Enabling PF1 here removes the userspace ordering requirement.
+ */
+static void cxl_type2_enable_pf1(struct pci_dev *pf0)
+{
+	struct pci_dev *pf1;
+	u16 cmd, want;
+
+	pf1 = pci_get_slot(pf0->bus, PCI_DEVFN(PCI_SLOT(pf0->devfn), 1));
+	if (!pf1) {
+		dev_warn(&pf0->dev,
+			 "PF1 not enumerated; AFU CXL.mem path will be inactive\n");
+		return;
+	}
+
+	want = PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER |
+	       PCI_COMMAND_PARITY | PCI_COMMAND_SERR;
+	pci_read_config_word(pf1, PCI_COMMAND, &cmd);
+	if ((cmd & want) != want) {
+		pci_write_config_word(pf1, PCI_COMMAND, cmd | want);
+		pci_read_config_word(pf1, PCI_COMMAND, &cmd);
+	}
+
+	dev_info(&pf0->dev, "PF1 %s enabled (COMMAND=0x%04x)\n",
+		 pci_name(pf1), cmd);
+
+	pci_dev_put(pf1);
 }
 
 static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -554,6 +347,7 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		return rc;
 	pci_set_master(pdev);
+	cxl_type2_enable_pf1(pdev);
 
 	/* Allocate cxl_memdev_state (embeds cxl_dev_state at offset 0) */
 	mds = devm_kzalloc(&pdev->dev, sizeof(*mds), GFP_KERNEL);
@@ -824,9 +618,26 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				}
 
 				if (hdm_base) {
-					u32 ctrl, status;
+					u32 global_ctrl, ctrl;
 					u64 base_pa = 0x4080000000ULL;
 					u64 size = mds->total_bytes;
+
+					/*
+					 * Enable HDM decoding globally before
+					 * programming Decoder 0.  cxl_hdm_decode_init()
+					 * does this in the canonical flow; without it
+					 * Decoder 0 reads back as committed but the
+					 * device does not actually decode CXL.mem
+					 * traffic, and host writes to the HPA window
+					 * fault on the device side.  Read-modify-write
+					 * to preserve other bits in the global control.
+					 */
+					global_ctrl = readl(hdm_base + CXL_HDM_DECODER_CTRL_OFFSET);
+					if (!(global_ctrl & CXL_HDM_DECODER_ENABLE)) {
+						writel(global_ctrl | CXL_HDM_DECODER_ENABLE,
+						       hdm_base + CXL_HDM_DECODER_CTRL_OFFSET);
+						global_ctrl = readl(hdm_base + CXL_HDM_DECODER_CTRL_OFFSET);
+					}
 
 					/* DECODER0_BASE */
 					writel(lower_32_bits(base_pa), hdm_base + 0x10);
@@ -834,15 +645,14 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					/* DECODER0_SIZE */
 					writel(lower_32_bits(size), hdm_base + 0x18);
 					writel(upper_32_bits(size), hdm_base + 0x1C);
-					/* Commit: bit 9 */
+					/* DECODER0_CTRL: commit (bit 9) */
 					writel(1 << 9, hdm_base + 0x20);
 					msleep(100);
 
 					ctrl = readl(hdm_base + 0x20);
-					status = readl(hdm_base + 0x08);
 					dev_info(&pdev->dev,
-						 "HDM Decoder 0 force-committed: ctrl=0x%x status=0x%x base=0x%llx size=0x%llx\n",
-						 ctrl, status, base_pa, size);
+						 "HDM Decoder 0 force-committed: global_ctrl=0x%x ctrl=0x%x base=0x%llx size=0x%llx\n",
+						 global_ctrl, ctrl, base_pa, size);
 				} else {
 					dev_warn(&pdev->dev,
 						 "HDM Decoder capability not found in component regs\n");
