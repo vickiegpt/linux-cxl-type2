@@ -652,22 +652,15 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * endpoint port probe (triggered inside devm_cxl_add_memdev) reads
 	 * a non-zero HPA range from the device.
 	 *
-	 * On this IA-780I bitstream the device's HDM BASE register is locked
-	 * to 0x4080000000 — writes to other HPAs read back as 0x4080000000.
-	 * That HPA falls inside CFMWS root decoder0.0 (Type 3, target_list=3),
-	 * not the Type 2 root decoder0.12 (HPA 0x180000000000, target_list=50)
-	 * which is the platform-allocated Type 2 window for this device's host
-	 * bridge.  As a result cxl_region_attach() can't sort this endpoint
-	 * into any committed root decoder: the address-matching decoder
-	 * doesn't list our host bridge, and the host-bridge-matching decoder
-	 * doesn't cover the device's HW HPA.  The standard auto-region attach
-	 * is therefore expected to fail with -ENXIO at probe time; this is a
-	 * known limitation of the current FPGA bitstream and does not break
-	 * the rest of the driver — userspace consumes the device via the
-	 * tmatmul ioctl + an out-of-band devdax mmap (see
-	 * docs/superpowers/specs/2026-05-19-tmatmul-csr-only-design.md).
+	 * Use the IA-780I platform's CFMWS Type-2 window for this device's
+	 * host bridge (dport50): HPA 0x180000000000.  This must match the
+	 * BASE reset value in the FPGA bitstream's cafu_csr0_cfg_pkg.sv
+	 * (HDM_DEC_BASEHIGH_RESET=0x1800).  With the addresses aligned,
+	 * cxl_find_root_decoder() picks decoder0.12 (cap_type2=1,
+	 * target_list=50), and the standard cxl_region_attach() flow can
+	 * route this endpoint into the platform-managed Type-2 region.
 	 */
-	cxl_type2_force_commit_hdm(pdev, 0x4080000000ULL, mds->total_bytes);
+	cxl_type2_force_commit_hdm(pdev, 0x180000000000ULL, mds->total_bytes);
 
 	/* Register as a CXL memory device for decoder/region/DAX flow */
 	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);
