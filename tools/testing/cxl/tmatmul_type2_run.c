@@ -109,7 +109,9 @@ static int resolve_pci_path(const char *dev_path, char *out, size_t outsz)
 	char canon[PATH_MAX];
 	if (out[0] != '/') {
 		char tmp[PATH_MAX];
-		snprintf(tmp, sizeof(tmp), "/sys/class/misc/%s/%s", base, out);
+		if (snprintf(tmp, sizeof(tmp), "/sys/class/misc/%s/%s", base, out)
+		    >= (int)sizeof(tmp))
+			return -1;
 		if (!realpath(tmp, canon))
 			return -1;
 	} else {
@@ -159,8 +161,10 @@ static int find_dax_for_pci(const char *pci_path,
 			if (strncmp(r->d_name, "region", 6) != 0)
 				continue;
 			char region_path[PATH_MAX];
-			snprintf(region_path, sizeof(region_path),
-				 "%s/%s", memdir, r->d_name);
+			if (snprintf(region_path, sizeof(region_path),
+				     "%s/%s", memdir, r->d_name)
+			    >= (int)sizeof(region_path))
+				continue;
 			char region_canon[PATH_MAX];
 			if (!realpath(region_path, region_canon))
 				continue;
@@ -174,8 +178,10 @@ static int find_dax_for_pci(const char *pci_path,
 				if (strncmp(dr->d_name, "dax_region", 10) != 0)
 					continue;
 				char drpath[PATH_MAX];
-				snprintf(drpath, sizeof(drpath),
-					 "%s/%s", region_canon, dr->d_name);
+				if (snprintf(drpath, sizeof(drpath),
+					     "%s/%s", region_canon, dr->d_name)
+				    >= (int)sizeof(drpath))
+					continue;
 				DIR *dd = opendir(drpath);
 				if (!dd)
 					continue;
@@ -335,65 +341,20 @@ static void invalidate_range(volatile void *start, size_t len)
 	_mm_lfence();
 }
 
-static const char *short_bdf(const char *bdf)
-{
-	if (!strncmp(bdf, "0000:", 5))
-		return bdf + 5;
-	return bdf;
-}
-
-static int run_setpci_pf1(const char *pf1)
-{
-	pid_t pid;
-	int status;
-
-	pid = fork();
-	if (pid < 0) {
-		perror("fork");
-		return -1;
-	}
-
-	if (!pid) {
-		execlp("setpci", "setpci", "-s", short_bdf(pf1),
-		       "COMMAND=0x0146", (char *)NULL);
-		perror("execlp(setpci)");
-		_exit(127);
-	}
-
-	if (waitpid(pid, &status, 0) < 0) {
-		perror("waitpid");
-		return -1;
-	}
-
-	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
-		fprintf(stderr, "setpci failed for %s (status=0x%x)\n",
-			pf1, status);
-		return -1;
-	}
-
-	return 0;
-}
-
 static void print_info(const struct cxl_type2_tmatmul_info *info)
 {
 	printf("info:\n");
-	printf("  version:          %u\n", info->version);
-	printf("  dev_id:           0x%08x\n", info->dev_id);
-	printf("  num_instances:    %u\n", info->num_instances);
-	printf("  dim_d:            %u\n", info->dim_d);
-	printf("  ddr_data_width:   %u\n", info->ddr_data_width);
-	printf("  mc_status:        0x%08x\n", info->mc_status);
-	printf("  default_hpa_base: 0x%016" PRIx64 "\n",
-	       (uint64_t)info->default_hpa_base);
-	printf("  default_hpa_size: 0x%016" PRIx64 "\n",
-	       (uint64_t)info->default_hpa_size);
+	printf("  version:        %u\n", info->version);
+	printf("  dev_id:         0x%08x\n", info->dev_id);
+	printf("  num_instances:  %u\n", info->num_instances);
+	printf("  dim_d:          %u\n", info->dim_d);
+	printf("  ddr_data_width: %u\n", info->ddr_data_width);
+	printf("  mc_status:      0x%08x\n", info->mc_status);
 }
 
-static void print_run(const struct cxl_type2_tmatmul_run *run)
+static void print_run(const struct cxl_type2_tmatmul_csr_run *run)
 {
 	printf("run:\n");
-	printf("  hpa_base:     0x%016" PRIx64 "\n", (uint64_t)run->hpa_base);
-	printf("  hpa_size:     0x%016" PRIx64 "\n", (uint64_t)run->hpa_size);
 	printf("  dim_d:        %u\n", run->dim_d);
 	printf("  dma_status:   0x%02x\n", run->dma_status);
 	printf("  stall_status: %u\n", run->stall_status);
@@ -404,28 +365,24 @@ static void print_run(const struct cxl_type2_tmatmul_run *run)
 int main(int argc, char **argv)
 {
 	const char *dev = DEFAULT_DEV;
-	const char *pf1 = DEFAULT_PF1;
-	uint64_t hpa_base = DEFAULT_HPA_BASE;
-	uint64_t hpa_size = DEFAULT_HPA_SIZE;
+	const char *dax_override = NULL;
 	uint32_t timeout_ms = DEFAULT_TIMEOUT_MS;
-	bool apply_setpci = false;
 	struct cxl_type2_tmatmul_info info = {};
-	struct cxl_type2_tmatmul_run run = {};
-	int fd, rc, saved_errno;
+	struct cxl_type2_tmatmul_csr_run run = {};
+	char dax_path[PATH_MAX];
+	uint64_t dax_size = 0;
+	int fd_dev = -1, fd_dax = -1, exit_rc = EXIT_FAILURE;
+	void *base = MAP_FAILED;
+	uint32_t dim_d;
+	size_t matrix_len, vector_len, used_len;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--dev") && i + 1 < argc) {
 			dev = argv[++i];
-		} else if (!strcmp(argv[i], "--hpa-base") && i + 1 < argc) {
-			hpa_base = parse_u64(argv[++i], "hpa-base");
-		} else if (!strcmp(argv[i], "--hpa-size") && i + 1 < argc) {
-			hpa_size = parse_u64(argv[++i], "hpa-size");
+		} else if (!strcmp(argv[i], "--dax") && i + 1 < argc) {
+			dax_override = argv[++i];
 		} else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
-			timeout_ms = parse_u64(argv[++i], "timeout-ms");
-		} else if (!strcmp(argv[i], "--apply-setpci")) {
-			apply_setpci = true;
-		} else if (!strcmp(argv[i], "--pf1") && i + 1 < argc) {
-			pf1 = argv[++i];
+			timeout_ms = (uint32_t)parse_u64(argv[++i], "timeout-ms");
 		} else if (!strcmp(argv[i], "--help")) {
 			usage(argv[0]);
 			return 0;
@@ -435,47 +392,115 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (apply_setpci) {
-		printf("setpci: PF1 %s COMMAND=0x0146\n", pf1);
-		if (run_setpci_pf1(pf1))
+	/* 1. Locate the devdax window backing this tmatmul device. */
+	if (dax_override) {
+		if (strlen(dax_override) >= sizeof(dax_path)) {
+			fprintf(stderr, "--dax path too long\n");
 			return EXIT_FAILURE;
+		}
+		strcpy(dax_path, dax_override);
+	} else if (discover_dax(dev, dax_path, sizeof(dax_path)) < 0) {
+		return EXIT_FAILURE;
 	}
+	printf("dax_path: %s\n", dax_path);
 
-	fd = open(dev, O_RDWR);
-	if (fd < 0) {
+	if (read_dax_size(dax_path, &dax_size) < 0)
+		return EXIT_FAILURE;
+	printf("dax_size: 0x%" PRIx64 "\n", dax_size);
+
+	/* 2. Open the misc device and read static info. */
+	fd_dev = open(dev, O_RDWR);
+	if (fd_dev < 0) {
 		perror(dev);
 		return EXIT_FAILURE;
 	}
-
-	if (ioctl(fd, CXL_TYPE2_TMATMUL_GET_INFO, &info)) {
+	if (ioctl(fd_dev, CXL_TYPE2_TMATMUL_GET_INFO, &info)) {
 		perror("CXL_TYPE2_TMATMUL_GET_INFO");
-		close(fd);
-		return EXIT_FAILURE;
+		goto out;
 	}
 	print_info(&info);
+	dim_d = info.dim_d;
+	if (!dim_d) {
+		fprintf(stderr, "device reports dim_d=0\n");
+		goto out;
+	}
 
-	run.hpa_base = hpa_base;
-	run.hpa_size = hpa_size;
+	matrix_len = (size_t)dim_d * dim_d / 4;
+	vector_len = (size_t)dim_d * sizeof(uint16_t);
+	used_len   = TMATMUL_DPA_PROGRAM + TMATMUL_PROGRAM_BYTES;
+
+	if (used_len > dax_size) {
+		fprintf(stderr,
+			"dax window 0x%" PRIx64 " too small for layout 0x%zx\n",
+			dax_size, used_len);
+		goto out;
+	}
+
+	/* 3. mmap the full dax window. */
+	fd_dax = open(dax_path, O_RDWR);
+	if (fd_dax < 0) {
+		perror(dax_path);
+		goto out;
+	}
+	base = mmap(NULL, dax_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		    fd_dax, 0);
+	if (base == MAP_FAILED) {
+		perror("mmap");
+		goto out;
+	}
+
+	/* 4. Lay out matrix/input/output/program. */
+	memset((char *)base + TMATMUL_DPA_MATRIX, 0, matrix_len);
+	fill_input_vector((uint8_t *)base + TMATMUL_DPA_INPUT, dim_d);
+	memset((char *)base + TMATMUL_DPA_OUTPUT, OUTPUT_SENTINEL, vector_len);
+	encode_smoke_program((uint8_t *)base + TMATMUL_DPA_PROGRAM);
+
+	/* 5. Flush the touched cachelines so the device sees the writes. */
+	flush_range((char *)base + TMATMUL_DPA_MATRIX,  matrix_len);
+	flush_range((char *)base + TMATMUL_DPA_INPUT,   vector_len);
+	flush_range((char *)base + TMATMUL_DPA_OUTPUT,  vector_len);
+	flush_range((char *)base + TMATMUL_DPA_PROGRAM, TMATMUL_PROGRAM_BYTES);
+
+	/* 6. Kick the device. */
 	run.timeout_ms = timeout_ms;
-	run.flags = CXL_TYPE2_TMATMUL_RUN_SMOKE;
-
-	rc = ioctl(fd, CXL_TYPE2_TMATMUL_RUN, &run);
-	saved_errno = errno;
+	int rc = ioctl(fd_dev, CXL_TYPE2_TMATMUL_RUN_CSR_ONLY, &run);
+	int saved_errno = errno;
 	print_run(&run);
-	close(fd);
-
 	if (rc) {
 		errno = saved_errno;
-		perror("CXL_TYPE2_TMATMUL_RUN");
-		return EXIT_FAILURE;
+		perror("CXL_TYPE2_TMATMUL_RUN_CSR_ONLY");
+		goto out;
+	}
+	if (!(run.result_flags & CXL_TYPE2_TMATMUL_RESULT_STALLED)) {
+		fprintf(stderr, "device did not reach stall before timeout\n");
+		goto out;
+	}
+	if (run.result_flags & CXL_TYPE2_TMATMUL_RESULT_DMA_ERROR) {
+		fprintf(stderr, "device reported DMA error\n");
+		goto out;
 	}
 
-	if (!(run.result_flags & CXL_TYPE2_TMATMUL_RESULT_STALLED) ||
-	    !(run.result_flags & CXL_TYPE2_TMATMUL_RESULT_OUTPUT_ZERO)) {
-		fprintf(stderr, "tmatmul smoke did not complete cleanly\n");
-		return EXIT_FAILURE;
+	/* 7. Invalidate the output region in our cache, then verify. */
+	invalidate_range((char *)base + TMATMUL_DPA_OUTPUT, vector_len);
+	uint8_t *out_bytes = (uint8_t *)base + TMATMUL_DPA_OUTPUT;
+	for (size_t i = 0; i < vector_len; i++) {
+		if (out_bytes[i] != 0) {
+			fprintf(stderr,
+				"output non-zero at offset 0x%zx: 0x%02x\n",
+				i, out_bytes[i]);
+			goto out;
+		}
 	}
 
-	printf("PASS: tmatmul smoke completed and output buffer is zero\n");
-	return 0;
+	printf("PASS: tmatmul smoke stalled cleanly; output buffer is zero\n");
+	exit_rc = 0;
+
+out:
+	if (base != MAP_FAILED)
+		munmap(base, dax_size);
+	if (fd_dax >= 0)
+		close(fd_dax);
+	if (fd_dev >= 0)
+		close(fd_dev);
+	return exit_rc;
 }
