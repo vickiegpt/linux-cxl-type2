@@ -260,4 +260,19 @@ config CXL_TYPE2_ACCEL
 
 	  If unsure, say 'm'.
 
+config CXL_SWITCH_CCI
+	tristate "CXL: Switch CCI PCI Support"
+	depends on CXL_BUS
+	help
+	  Enables a minimal PCI binding driver for CXL switch mailbox CCI
+	  functions. This is intended for early switch/Fabric Manager testing
+	  with emulated devices such as the Zettai QEMU CXL switch CCI function
+	  using PCI ID 7a74:a123.
+
+	  This driver claims the PCI function and exposes basic device state for
+	  test automation. Full CXL Switch CCI and FMAPI command handling is not
+	  implemented here yet.
+
+	  If unsure, say 'm'.
+
 endif

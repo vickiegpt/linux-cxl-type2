@@ -15,6 +15,7 @@ obj-$(CONFIG_CXL_MEM) += cxl_mem.o
 obj-$(CONFIG_CXL_PCI) += cxl_pci.o
 obj-$(CONFIG_CXL_CACHE) += cxl_cache.o
 obj-$(CONFIG_CXL_TYPE2_ACCEL) += cxl_type2_accel.o
+obj-$(CONFIG_CXL_SWITCH_CCI) += cxl_switch_cci.o
 
 cxl_port-y := port.o
 cxl_acpi-y := acpi.o

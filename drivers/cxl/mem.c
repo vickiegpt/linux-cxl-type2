@@ -144,6 +144,12 @@ static int cxl_mem_probe(struct device *dev)
 			return rc;
 	}
 
+	rc = cxl_bi_setup(cxlds);
+	if (rc) {
+		dev_dbg(dev, "BI setup failed rc=%d\n", rc);
+		return rc;
+	}
+
 	rc = devm_cxl_memdev_edac_register(cxlmd);
 	if (rc)
 		dev_dbg(dev, "CXL memdev EDAC registration failed rc=%d\n", rc);
