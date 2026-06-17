@@ -20,6 +20,18 @@ static u64 rch_hpa_size = 0x400000000ULL; /* 16GB */
 module_param(rch_hpa_size, ullong, 0644);
 MODULE_PARM_DESC(rch_hpa_size, "Size of synthetic RCH CXL window");
 
+/*
+ * When an RCH device is physically downstream of a VH host bridge,
+ * set this to the VH dport's UID so the synthetic decoder targets
+ * the correct (SAD-routed) dport instead of the RCH's own dport.
+ * Example: bus 3b (UID=2, RCH) is physically under bus 14 (UID=3, VH)
+ *   => set rch_parent_uid=3
+ */
+static int rch_parent_uid = -1;
+module_param(rch_parent_uid, int, 0644);
+MODULE_PARM_DESC(rch_parent_uid,
+		 "UID of VH dport that physically parents the RCH device (-1=auto)");
+
 static const guid_t acpi_cxl_qtg_id_guid =
 	GUID_INIT(0xF365F9A6, 0xA7DE, 0x4071,
 		  0xA6, 0x6A, 0xB4, 0x0C, 0x0B, 0x4F, 0x8E, 0x52);
@@ -665,6 +677,70 @@ static int add_host_bridge_dport(struct device *match, void *arg)
 	if (rc)
 		return rc;
 
+	if (rch_parent_uid >= 0)
+		dev_info(match,
+			 "RCH alias scan: uid=%lld cxl_version=%u base=%pa parent_uid=%d\n",
+			 ctx.uid, ctx.cxl_version, &ctx.base, rch_parent_uid);
+
+	/*
+	 * When rch_parent_uid is set, alias this RCH host bridge under
+	 * the VH parent dport.  This check must run before the no-CHBS
+	 * early return so that RCH bridges without their own CEDT entry
+	 * can still participate in the CXL port topology via the VH parent.
+	 */
+	if (rch_parent_uid >= 0 &&
+	    (ctx.cxl_version == UINT_MAX ||
+	     ctx.cxl_version == ACPI_CEDT_CHBS_VERSION_CXL11) &&
+	    ctx.uid != rch_parent_uid) {
+		struct cxl_dport *parent_dp = NULL;
+		struct cxl_dport *dp;
+		unsigned long idx;
+		int xa_rc;
+
+		pci_root = acpi_pci_find_root(hb->handle);
+		if (!pci_root) {
+			dev_warn(match,
+				 "No PCI root for Host Bridge (UID %lld)\n",
+				 ctx.uid);
+			return 0;
+		}
+		bridge = pci_root->bus->bridge;
+
+		xa_for_each(&root_port->dports, idx, dp) {
+			if (dp->port_id == rch_parent_uid) {
+				parent_dp = dp;
+				break;
+			}
+		}
+
+		if (parent_dp) {
+			/*
+			 * Insert the RCH bridge device as an alias pointing
+			 * to the VH parent dport.  cxl_find_dport_by_dev()
+			 * uses xa_load with dport_dev as key, so this makes
+			 * lookups for the RCH bus return the VH dport struct.
+			 */
+			device_lock(&root_port->dev);
+			xa_rc = xa_insert(&root_port->dports,
+					  (unsigned long)bridge,
+					  parent_dp, GFP_KERNEL);
+			device_unlock(&root_port->dev);
+			if (xa_rc)
+				dev_warn(match,
+					 "Failed to alias RCH UID %lld under VH dport %d: %d\n",
+					 ctx.uid, rch_parent_uid, xa_rc);
+			else
+				dev_info(match,
+					 "RCH UID %lld (%s) aliased under VH dport %d\n",
+					 ctx.uid, dev_name(bridge),
+					 rch_parent_uid);
+			return 0;
+		}
+		dev_warn(match,
+			 "VH dport %d not found, falling back to RCH dport\n",
+			 rch_parent_uid);
+	}
+
 	if (ctx.cxl_version == UINT_MAX) {
 		dev_warn(match, "No CHBS found for Host Bridge (UID %lld)\n",
 			 ctx.uid);
@@ -701,6 +777,75 @@ static int add_host_bridge_dport(struct device *match, void *arg)
 	ret = get_genport_coordinates(match, dport);
 	if (ret)
 		dev_dbg(match, "Failed to get generic port perf coordinates.\n");
+
+	return 0;
+}
+
+static int alias_rch_parent_dport(struct device *match, void *arg)
+{
+	struct cxl_port *root_port = arg;
+	struct device *host = root_port->dev.parent;
+	struct acpi_device *hb = to_cxl_host_bridge(host, match);
+	struct cxl_dport *parent_dp = NULL;
+	struct cxl_chbs_context ctx;
+	struct acpi_pci_root *pci_root;
+	struct cxl_dport *dp;
+	struct device *bridge;
+	unsigned long idx;
+	acpi_status rc;
+	int xa_rc;
+
+	if (rch_parent_uid < 0 || !hb)
+		return 0;
+
+	rc = cxl_get_chbs(match, hb, &ctx);
+	if (rc)
+		return rc;
+
+	if (ctx.uid == rch_parent_uid)
+		return 0;
+
+	if (ctx.cxl_version != UINT_MAX &&
+	    ctx.cxl_version != ACPI_CEDT_CHBS_VERSION_CXL11)
+		return 0;
+
+	pci_root = acpi_pci_find_root(hb->handle);
+	if (!pci_root) {
+		dev_warn(match, "No PCI root for Host Bridge (UID %lld)\n",
+			 ctx.uid);
+		return 0;
+	}
+
+	bridge = pci_root->bus->bridge;
+	if (cxl_find_dport_by_dev(root_port, bridge))
+		return 0;
+
+	xa_for_each(&root_port->dports, idx, dp) {
+		if (dp->port_id == rch_parent_uid) {
+			parent_dp = dp;
+			break;
+		}
+	}
+
+	if (!parent_dp) {
+		dev_warn(match,
+			 "VH dport %d not found for second-pass RCH UID %lld alias\n",
+			 rch_parent_uid, ctx.uid);
+		return 0;
+	}
+
+	device_lock(&root_port->dev);
+	xa_rc = xa_insert(&root_port->dports, (unsigned long)bridge,
+			  parent_dp, GFP_KERNEL);
+	device_unlock(&root_port->dev);
+	if (xa_rc && xa_rc != -EBUSY)
+		dev_warn(match,
+			 "Failed second-pass RCH UID %lld (%s) alias under VH dport %d: %d\n",
+			 ctx.uid, dev_name(bridge), rch_parent_uid, xa_rc);
+	else
+		dev_info(match,
+			 "RCH UID %lld (%s) second-pass aliased under VH dport %d\n",
+			 ctx.uid, dev_name(bridge), rch_parent_uid);
 
 	return 0;
 }
@@ -939,6 +1084,13 @@ static int check_dport_has_decoder(struct device *dev, void *data)
  * @cxl_res: CXL resource tree
  * @ctx: CFMWS context (for id counter)
  * @host: device for devm allocations
+ *
+ * When rch_parent_uid is set, the synthetic decoder targets the VH parent
+ * dport instead of the RCH dport.  This is needed when an RCH device is
+ * physically downstream of a VH host bridge (e.g. IA-780i: bus 3b RCH
+ * is physically under bus 14 VH).  The CPU's SAD already routes HPA
+ * traffic to the VH root port, which physically connects to the RCH
+ * device, so the decoder must target the VH dport for CXL.mem to work.
  */
 static void cxl_inject_synthetic_cfmws(struct cxl_port *root_port,
 					struct resource *cxl_res,
@@ -947,6 +1099,7 @@ static void cxl_inject_synthetic_cfmws(struct cxl_port *root_port,
 {
 	struct cxl_dport *dport;
 	unsigned long index;
+	int target_uid;
 
 	if (!rch_hpa_size)
 		return;
@@ -970,9 +1123,31 @@ static void cxl_inject_synthetic_cfmws(struct cxl_port *root_port,
 			continue;
 		}
 
+		/*
+		 * If rch_parent_uid is set, target the VH parent dport
+		 * instead of the RCH dport.  Verify the parent dport exists.
+		 */
+		target_uid = dport->port_id;
+		if (rch_parent_uid >= 0) {
+			struct cxl_dport *parent_dp;
+
+			parent_dp = xa_load(&root_port->dports,
+					    (unsigned long)rch_parent_uid);
+			if (parent_dp) {
+				target_uid = rch_parent_uid;
+				dev_info(host,
+					 "RCH dport %d reparented under VH dport %d\n",
+					 dport->port_id, target_uid);
+			} else {
+				dev_warn(host,
+					 "rch_parent_uid=%d not found, using dport %d\n",
+					 rch_parent_uid, dport->port_id);
+			}
+		}
+
 		dev_info(host,
-			 "Injecting synthetic CFMWS for RCH dport %d: [%#llx-%#llx]\n",
-			 dport->port_id, rch_hpa_base,
+			 "Injecting synthetic CFMWS for RCH dport %d (target=%d): [%#llx-%#llx]\n",
+			 dport->port_id, target_uid, rch_hpa_base,
 			 rch_hpa_base + rch_hpa_size - 1);
 
 		res = alloc_cxl_resource(rch_hpa_base, rch_hpa_size, ctx->id++);
@@ -1004,7 +1179,7 @@ static void cxl_inject_synthetic_cfmws(struct cxl_port *root_port,
 		};
 		cxld->interleave_ways = 1;
 		cxld->interleave_granularity = CXL_DECODER_MIN_GRANULARITY;
-		cxld->target_map[0] = dport->port_id;
+		cxld->target_map[0] = target_uid;
 
 		rc = cxl_decoder_add(cxld);
 		if (rc) {
@@ -1019,8 +1194,82 @@ static void cxl_inject_synthetic_cfmws(struct cxl_port *root_port,
 			return;
 		}
 
-		dev_info(host, "Synthetic root decoder %s added for RCH dport %d\n",
-			 dev_name(&cxld->dev), dport->port_id);
+		dev_info(host, "Synthetic root decoder %s added for RCH dport %d (target=%d)\n",
+			 dev_name(&cxld->dev), dport->port_id, target_uid);
+	}
+
+	/*
+	 * When rch_parent_uid is set, the VH parent dport may already have a
+	 * HOSTONLYMEM decoder from the BIOS CFMWS.  Inject an additional
+	 * DEVMEM decoder so Type 2 endpoints can attach to a region.
+	 */
+	if (rch_parent_uid >= 0 && rch_hpa_size) {
+		struct cxl_root_decoder *cxlrd;
+		struct cxl_decoder *cxld;
+		struct resource *res;
+		int rc;
+
+		dev_info(host,
+			 "Adding synthetic DEVMEM decoder for VH dport %d: [%#llx-%#llx]\n",
+			 rch_parent_uid, rch_hpa_base,
+			 rch_hpa_base + rch_hpa_size - 1);
+
+		res = alloc_cxl_resource(rch_hpa_base, rch_hpa_size, ctx->id++);
+		if (!res) {
+			dev_err(host, "Failed to alloc synthetic DEVMEM resource\n");
+			return;
+		}
+
+		rc = add_or_reset_cxl_resource(cxl_res, res);
+		if (rc) {
+			dev_err(host,
+				"Failed to add synthetic DEVMEM resource [%#llx-%#llx]: %d\n",
+				rch_hpa_base, rch_hpa_base + rch_hpa_size - 1,
+				rc);
+			return;
+		}
+
+		cxlrd = cxl_root_decoder_alloc(root_port, 1);
+		if (IS_ERR(cxlrd)) {
+			dev_err(host,
+				"Failed to alloc synthetic DEVMEM root decoder: %ld\n",
+				PTR_ERR(cxlrd));
+			return;
+		}
+
+		cxld = &cxlrd->cxlsd.cxld;
+		cxld->flags = CXL_DECODER_F_ENABLE | CXL_DECODER_F_TYPE2 |
+			      CXL_DECODER_F_RAM;
+		cxld->target_type = CXL_DECODER_DEVMEM;
+		cxld->hpa_range = (struct range){
+			.start = rch_hpa_base,
+			.end = rch_hpa_base + rch_hpa_size - 1,
+		};
+		cxld->interleave_ways = 1;
+		cxld->interleave_granularity = CXL_DECODER_MIN_GRANULARITY;
+		cxld->target_map[0] = rch_parent_uid;
+
+		rc = cxl_decoder_add(cxld);
+		if (rc) {
+			dev_err(host,
+				"Failed to add synthetic DEVMEM decoder for VH dport %d: %d\n",
+				rch_parent_uid, rc);
+			put_device(&cxld->dev);
+			return;
+		}
+
+		rc = cxl_root_decoder_autoremove(host, cxlrd);
+		if (rc) {
+			dev_err(host,
+				"Failed autoremove for synthetic DEVMEM decoder %s: %d\n",
+				dev_name(&cxld->dev), rc);
+			return;
+		}
+
+		dev_info(host,
+			 "Synthetic DEVMEM decoder %s for VH dport %d: [%#llx-%#llx]\n",
+			 dev_name(&cxld->dev), rch_parent_uid,
+			 rch_hpa_base, rch_hpa_base + rch_hpa_size - 1);
 	}
 }
 
@@ -1055,6 +1304,11 @@ static int cxl_acpi_probe(struct platform_device *pdev)
 
 	rc = bus_for_each_dev(adev->dev.bus, NULL, root_port,
 			      add_host_bridge_dport);
+	if (rc < 0)
+		return rc;
+
+	rc = bus_for_each_dev(adev->dev.bus, NULL, root_port,
+			      alias_rch_parent_dport);
 	if (rc < 0)
 		return rc;
 

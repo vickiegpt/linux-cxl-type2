@@ -474,15 +474,24 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (dvsec) {
 		u16 cap, ctrl;
 
-		pci_read_config_word(pdev, dvsec + CXL_DVSEC_CAP_OFFSET, &cap);
-		pci_read_config_word(pdev, dvsec + CXL_DVSEC_CTRL_OFFSET, &ctrl);
+			pci_read_config_word(pdev, dvsec + CXL_DVSEC_CAP_OFFSET, &cap);
+			pci_read_config_word(pdev, dvsec + CXL_DVSEC_CTRL_OFFSET, &ctrl);
 
-		dev_info(&pdev->dev, "CXL DVSEC: cap=0x%04x ctrl=0x%04x\n",
-			 cap, ctrl);
+			dev_info(&pdev->dev, "CXL DVSEC: cap=0x%04x ctrl=0x%04x\n",
+				 cap, ctrl);
 
-		/*
-		 * Enable all advertised CXL capabilities.
-		 * Type 2 accelerators typically need CXL.cache for
+			if (cxlds->reg_map.resource != CXL_RESOURCE_NONE &&
+			    cxlds->reg_map.component_map.hdm_decoder.valid &&
+			    (!(cap & CXL_DVSEC_MEM_CAPABLE) ||
+			     !(cap & CXL_DVSEC_HDM_COUNT_MASK))) {
+				cxlds->skip_dvsec_range_decode = true;
+				dev_warn(&pdev->dev,
+					 "CXL Device DVSEC lacks MemCapable/HDMCount; using component HDM decoder registers\n");
+			}
+
+			/*
+			 * Enable all advertised CXL capabilities.
+			 * Type 2 accelerators typically need CXL.cache for
 		 * CPU-device coherency, CXL.io for MMIO, and CXL.mem
 		 * for device-attached memory.
 		 */

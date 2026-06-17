@@ -1362,20 +1362,40 @@ int devm_cxl_endpoint_decoders_setup(struct cxl_port *port)
 		return -EOPNOTSUPP;
 
 	rc = cxl_dvsec_rr_decode(cxlds, &info);
-	if (rc < 0)
-		return rc;
+	if (rc < 0) {
+		if (cxlds->skip_dvsec_range_decode &&
+		    cxlds->reg_map.resource != CXL_RESOURCE_NONE &&
+		    cxlds->reg_map.component_map.hdm_decoder.valid) {
+			dev_warn(&port->dev,
+				 "DVSEC range decode failed: %d; using component HDM decoder registers\n",
+				 rc);
+			rc = 0;
+		} else {
+			dev_err(&port->dev, "DVSEC range decode failed: %d\n", rc);
+			return rc;
+		}
+	}
 
 	cxlhdm = devm_cxl_setup_hdm(port, &info);
 	if (IS_ERR(cxlhdm)) {
 		if (PTR_ERR(cxlhdm) == -ENODEV)
 			dev_err(&port->dev, "HDM decoder registers not found\n");
+		else
+			dev_err(&port->dev, "HDM decoder setup failed: %ld\n",
+				PTR_ERR(cxlhdm));
 		return PTR_ERR(cxlhdm);
 	}
 
 	rc = cxl_hdm_decode_init(cxlds, cxlhdm, &info);
-	if (rc)
+	if (rc) {
+		dev_err(&port->dev, "HDM decode init failed: %d\n", rc);
 		return rc;
+	}
 
-	return devm_cxl_enumerate_decoders(cxlhdm, &info);
+	rc = devm_cxl_enumerate_decoders(cxlhdm, &info);
+	if (rc)
+		dev_err(&port->dev, "HDM decoder enumeration failed: %d\n", rc);
+
+	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(devm_cxl_endpoint_decoders_setup, "CXL");

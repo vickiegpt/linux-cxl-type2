@@ -855,6 +855,8 @@ struct cxl_cache_state {
  * @rcd: operating in RCD mode (CXL 3.0 9.11.8 CXL Devices Attached to an RCH)
  * @media_ready: Indicate whether the device media is usable
  * @hdmd: Whether this device is using HDM-D flows
+ * @skip_dvsec_range_decode: Trust component HDM registers when CXL Device DVSEC
+ *			    range/capability fields are unusable
  * @dpa_res: Overall DPA resource tree for the device
  * @part: DPA partition array
  * @nr_partitions: Number of DPA partitions
@@ -874,6 +876,7 @@ struct cxl_dev_state {
 	bool rcd;
 	bool media_ready;
 	bool hdmd;
+	bool skip_dvsec_range_decode;
 	struct resource dpa_res;
 	struct cxl_dpa_partition part[CXL_NR_PARTITIONS_MAX];
 	unsigned int nr_partitions;
