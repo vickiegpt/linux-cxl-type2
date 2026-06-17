@@ -17,6 +17,10 @@
 #define CXL_TYPE2_TMATMUL_RESULT_STALLED	(1U << 0)
 #define CXL_TYPE2_TMATMUL_RESULT_DMA_ERROR	(1U << 2)
 
+#define CXL_TYPE2_MEM_REQ_READ			0
+#define CXL_TYPE2_MEM_REQ_WRITE			1
+#define CXL_TYPE2_MEM_REQ_MAX_BYTES		(1U << 20)
+
 struct cxl_type2_tmatmul_info {
 	__u32 version;
 	__u32 dev_id;
@@ -44,11 +48,28 @@ struct cxl_type2_tmatmul_csr_run {
 	__u64 reserved1[4];
 };
 
+struct cxl_type2_mem_req {
+	/* Inputs. hpa_base/hpa_size may be zero to use module defaults. */
+	__u64 hpa_base;
+	__u64 hpa_size;
+	__u64 offset;
+	__u64 user_ptr;
+	__u32 size;
+	__u32 op;
+	__u32 flags;
+	__u32 reserved0;
+	__u64 reserved1[4];
+};
+
 #define CXL_TYPE2_TMATMUL_IOC_MAGIC		0xCE
 #define CXL_TYPE2_TMATMUL_GET_INFO		\
 	_IOR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x00, struct cxl_type2_tmatmul_info)
+#define CXL_TYPE2_TMATMUL_RUN			\
+	_IOWR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x01, struct cxl_type2_tmatmul_run)
+#define CXL_TYPE2_MEM_IO			\
+	_IOWR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x02, struct cxl_type2_mem_req)
 /* ioctl 0x01 was CXL_TYPE2_TMATMUL_RUN in v1; retired with no replacement. */
 #define CXL_TYPE2_TMATMUL_RUN_CSR_ONLY		\
-	_IOWR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x02, struct cxl_type2_tmatmul_csr_run)
+	_IOWR(CXL_TYPE2_TMATMUL_IOC_MAGIC, 0x03, struct cxl_type2_tmatmul_csr_run)
 
 #endif /* _UAPI_LINUX_CXL_TYPE2_ACCEL_H */

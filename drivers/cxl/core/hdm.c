@@ -87,6 +87,8 @@ static void parse_hdm_decoder_caps(struct cxl_hdm *cxlhdm)
 		cxlhdm->iw_cap_mask |= BIT(3) | BIT(6) | BIT(12);
 	if (FIELD_GET(CXL_HDM_DECODER_INTERLEAVE_16_WAY, hdm_cap))
 		cxlhdm->iw_cap_mask |= BIT(16);
+	cxlhdm->supported_coherency =
+		FIELD_GET(CXL_HDM_DECODER_SUPPORTED_COHERENCY_MASK, hdm_cap);
 }
 
 static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
@@ -728,9 +730,26 @@ static void cxld_set_interleave(struct cxl_decoder *cxld, u32 *ctrl)
 
 static void cxld_set_type(struct cxl_decoder *cxld, u32 *ctrl)
 {
+	bool bi = cxld->target_type == CXL_DECODER_DEVMEM;
+
+	if (is_endpoint_decoder(&cxld->dev)) {
+		struct cxl_endpoint_decoder *cxled =
+			to_cxl_endpoint_decoder(&cxld->dev);
+		struct cxl_dev_state *cxlds = cxled_to_memdev(cxled)->cxlds;
+
+		bi = bi && cxlds->bi;
+	} else if (cxld->region) {
+		struct cxl_region *cxlr = cxld->region;
+		struct cxl_root_decoder *cxlrd =
+			to_cxl_root_decoder(cxlr->dev.parent);
+
+		bi = bi && (cxlrd->cxlsd.cxld.flags & CXL_DECODER_F_BI);
+	}
+
 	u32p_replace_bits(ctrl,
 			  !!(cxld->target_type == CXL_DECODER_HOSTONLYMEM),
 			  CXL_HDM_DECODER0_CTRL_HOSTONLY);
+	u32p_replace_bits(ctrl, bi, CXL_HDM_DECODER0_CTRL_BI);
 }
 
 static void cxlsd_set_targets(struct cxl_switch_decoder *cxlsd, u64 *tgt)
@@ -1125,6 +1144,14 @@ static int init_hdm_decoder(struct cxl_port *port, struct cxl_decoder *cxld,
 		else
 			cxld->target_type = CXL_DECODER_DEVMEM;
 
+		/*
+		 * Autocommit BI-enabled decoders are not supported. At this
+		 * point cxlds->bi is not yet set up, so the topology cannot be
+		 * verified.
+		 */
+		if (FIELD_GET(CXL_HDM_DECODER0_CTRL_BI, ctrl))
+			return -ENXIO;
+
 		guard(rwsem_write)(&cxl_rwsem.region);
 		if (cxld->id != cxl_num_decoders_committed(port)) {
 			dev_warn(&port->dev,
@@ -1144,12 +1171,17 @@ static int init_hdm_decoder(struct cxl_port *port, struct cxl_decoder *cxld,
 		if (cxled) {
 			struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
 			struct cxl_dev_state *cxlds = cxlmd->cxlds;
+			struct cxl_hdm *cxlhdm = dev_get_drvdata(&port->dev);
 
 			/*
-			 * Default by devtype until a device arrives that needs
-			 * more precision.
+			 * HDMs that advertise support for both coherency modes
+			 * default to host-only here. Region attach switches the
+			 * target type to device-coherent if the root decoder's
+			 * CFMWS has the BI bit set.
 			 */
-			if (cxlds->type == CXL_DEVTYPE_CLASSMEM)
+			if (cxlds->type == CXL_DEVTYPE_CLASSMEM &&
+			    cxlhdm->supported_coherency !=
+				    CXL_HDM_DECODER_COHERENCY_DEV)
 				cxld->target_type = CXL_DECODER_HOSTONLYMEM;
 			else
 				cxld->target_type = CXL_DECODER_DEVMEM;

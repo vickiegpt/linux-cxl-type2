@@ -56,6 +56,35 @@
 Module.symvers
 dtbs-list
 modules.order
+# NOTE! Please use 'git ls-files -i --exclude-standard'
+# command after changing this file, to see if there are
+# any tracked files which get ignored after the change.
+#
+# Normal rules
+#
+.*
+*.o
+*.o.*
+*.a
+*.s
+*.ko
+*.so
+*.so.dbg
+*.mod.c
+*.i
+*.lst
+*.symtypes
+*.order
+modules.builtin
+*.elf
+*.bin
+*.gz
+*.bz2
+*.lzma
+*.xz
+*.lzo
+*.patch
+*.gcno
 
 #
 # Top-level generic files
@@ -116,6 +145,20 @@ modules.order
 !.mailmap
 !.pylintrc
 !.rustfmt.toml
+/tags
+/TAGS
+/linux
+/vmlinux
+/vmlinuz
+/System.map
+/Module.markers
+/Module.symvers
+
+#
+# git files that we don't want to ignore even it they are dot-files
+#
+!.gitignore
+!.mailmap
 
 #
 # Generated include files
@@ -123,6 +166,10 @@ modules.order
 /include/config/
 /include/generated/
 /arch/*/include/generated/
+include/config
+include/linux/version.h
+include/generated
+arch/*/include/generated
 
 # stgit generated dirs
 patches-*
@@ -133,12 +180,9 @@ series
 
 # ctags files
 tags
-!tags/
 TAGS
 
 # cscope files
-cscope.*
-ncscope.*
 
 # gnu global files
 GPATH
@@ -183,3 +227,10 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+*.orig
+*~
+\#*#
+*.mod
+modules.builtin*
+certs
+vmlinux*
