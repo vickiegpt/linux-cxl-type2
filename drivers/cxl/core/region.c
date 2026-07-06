@@ -2007,6 +2007,9 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 	ep_port = cxled_to_port(cxled);
 	root_port = cxlrd_to_port(cxlrd);
 	dport = cxl_find_dport_by_dev(root_port, ep_port->host_bridge);
+	if (!dport && ep_port->parent_dport &&
+	    ep_port->parent_dport->port == root_port)
+		dport = ep_port->parent_dport;
 	if (!dport) {
 		dev_dbg(&cxlr->dev, "%s:%s invalid target for %s\n",
 			dev_name(&cxlmd->dev), dev_name(&cxled->cxld.dev),
@@ -2021,9 +2024,17 @@ static int cxl_region_attach(struct cxl_region *cxlr,
 	 */
 	if (cxlr->type == CXL_DECODER_DEVMEM &&
 	    cxlds->type == CXL_DEVTYPE_CLASSMEM && !cxlds->bi) {
-		dev_err(&cxlr->dev, "%s:%s BI not enabled on device\n",
-			dev_name(&cxlmd->dev), dev_name(&cxled->cxld.dev));
-		return -ENXIO;
+		if (!(cxlrd->cxlsd.cxld.flags & CXL_DECODER_F_TYPE2)) {
+			dev_err(&cxlr->dev, "%s:%s BI not enabled on device\n",
+				dev_name(&cxlmd->dev),
+				dev_name(&cxled->cxld.dev));
+			return -ENXIO;
+		}
+
+		dev_warn_once(&cxlr->dev,
+			      "%s:%s allowing no-BI Type-2 CXL.mem region\n",
+			      dev_name(&cxlmd->dev),
+			      dev_name(&cxled->cxld.dev));
 	}
 
 	cxlhdm = dev_get_drvdata(&ep_port->dev);

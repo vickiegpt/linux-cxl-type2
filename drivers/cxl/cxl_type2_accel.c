@@ -28,6 +28,12 @@
 #define CXL_TYPE2_DEVICE_ID_QEMU	0x0d92
 #define CXL_TYPE2_DEVICE_ID_IA780I	0x0ddb
 
+enum cxl_type2_match_role {
+	CXL_TYPE2_MATCH_GENERIC,
+	CXL_TYPE2_MATCH_IA780I_ACCEL,
+	CXL_TYPE2_MATCH_IA780I_MEM,
+};
+
 #define TMATMUL_DEV_ID			0x544D4D31 /* "TMM1" */
 #define TMATMUL_CSR_BASE		0x1C0000
 #define TMATMUL_CSR_SIZE		0x2000
@@ -38,7 +44,21 @@
 #define TMATMUL_REG_NUM_INSTANCES	0x004
 #define TMATMUL_REG_DIM_D		0x008
 #define TMATMUL_REG_DDR_DATA_WIDTH	0x00C
+#define TMATMUL_REG_DDR_PROBE_ADDR	0x010
+#define TMATMUL_REG_DDR_PROBE_WDATA	0x014
+#define TMATMUL_REG_DDR_PROBE_CTRL	0x018
+#define TMATMUL_REG_DDR_PROBE_RDATA	0x01C
+#define TMATMUL_REG_DDR_PROBE_STATUS	0x024
 #define TMATMUL_REG_MC_STATUS		0x018
+
+#define TMATMUL_DDR_PROBE_START		BIT(0)
+#define TMATMUL_DDR_PROBE_WRITE		BIT(1)
+#define TMATMUL_DDR_PROBE_STATUS_BUSY	0x1
+#define TMATMUL_DDR_PROBE_STATUS_DONE	0x2
+#define TMATMUL_DDR_PROBE_STATUS_ERROR	0x3
+#define TMATMUL_DDR_PROBE_WORD_BYTES	sizeof(u32)
+#define TMATMUL_DDR_PROBE_LINE_BYTES	64
+#define TMATMUL_DDR_PROBE_TIMEOUT_MS	250
 
 #define TMATMUL_INST_STALL_STATUS	0x00
 #define TMATMUL_INST_STALL_CLEAR	0x04
@@ -53,6 +73,21 @@
 #define TMATMUL_DMA_RUNNING		0x01
 #define TMATMUL_DMA_DONE		0x02
 #define TMATMUL_DMA_ERROR		0xFF
+
+static bool enable_cache;
+module_param(enable_cache, bool, 0644);
+MODULE_PARM_DESC(enable_cache,
+		 "Enable CXL.cache registration (default false; CXL-Secured uses CXL.mem)");
+
+static bool enable_memdev;
+module_param(enable_memdev, bool, 0644);
+MODULE_PARM_DESC(enable_memdev,
+		 "Register CXL memdev/HDM/DAX path (default false; CSR-only boot-safe mode)");
+
+static bool allow_uncommitted_hdm;
+module_param(allow_uncommitted_hdm, bool, 0644);
+MODULE_PARM_DESC(allow_uncommitted_hdm,
+		 "Allow memdev registration when HDM commit readback fails (unsafe; default false)");
 
 /*
  * Userspace places its instruction program at this device-physical-address
@@ -144,6 +179,183 @@ out_unlock:
 	return rc;
 }
 
+static int tmatmul_probe_wait(struct cxl_type2_tmatmul_dev *tmatmul)
+{
+	unsigned long deadline = jiffies +
+		msecs_to_jiffies(TMATMUL_DDR_PROBE_TIMEOUT_MS);
+	u32 status;
+
+	/*
+	 * The CSR-to-DDR probe status is level-held. Give the pulse synchronizer
+	 * time to observe the new request before polling, matching the userspace
+	 * BAR smoke that proved this path on IA-780I.
+	 */
+	usleep_range(5000, 6000);
+	do {
+		status = tmatmul_rd32(tmatmul, TMATMUL_REG_DDR_PROBE_STATUS);
+		switch (status & 0x3) {
+		case TMATMUL_DDR_PROBE_STATUS_DONE:
+			return 0;
+		case TMATMUL_DDR_PROBE_STATUS_ERROR:
+			return -EIO;
+		case TMATMUL_DDR_PROBE_STATUS_BUSY:
+		default:
+			usleep_range(1000, 2000);
+			break;
+		}
+	} while (time_before(jiffies, deadline));
+
+	return -ETIMEDOUT;
+}
+
+static int tmatmul_probe_write_dword(struct cxl_type2_tmatmul_dev *tmatmul,
+				     u64 offset, u32 value)
+{
+	if (offset > U32_MAX)
+		return -ERANGE;
+
+	tmatmul_wr32(tmatmul, TMATMUL_REG_DDR_PROBE_ADDR,
+		     lower_32_bits(offset));
+	tmatmul_wr32(tmatmul, TMATMUL_REG_DDR_PROBE_WDATA, value);
+	tmatmul_wr32(tmatmul, TMATMUL_REG_DDR_PROBE_CTRL,
+		     TMATMUL_DDR_PROBE_START | TMATMUL_DDR_PROBE_WRITE);
+
+	return tmatmul_probe_wait(tmatmul);
+}
+
+static int tmatmul_probe_read_dword(struct cxl_type2_tmatmul_dev *tmatmul,
+				    u64 offset, u32 *value)
+{
+	int rc;
+
+	if (offset > U32_MAX)
+		return -ERANGE;
+
+	tmatmul_wr32(tmatmul, TMATMUL_REG_DDR_PROBE_ADDR,
+		     lower_32_bits(offset));
+	tmatmul_wr32(tmatmul, TMATMUL_REG_DDR_PROBE_CTRL,
+		     TMATMUL_DDR_PROBE_START);
+
+	rc = tmatmul_probe_wait(tmatmul);
+	if (rc)
+		return rc;
+
+	*value = tmatmul_rd32(tmatmul, TMATMUL_REG_DDR_PROBE_RDATA);
+	return 0;
+}
+
+static int tmatmul_mem_io_write(struct cxl_type2_tmatmul_dev *tmatmul,
+				u64 offset, const u8 *buf, u32 size)
+{
+	u32 pos = 0;
+
+	/*
+	 * The IA-780I probe path is 32-bit, but the DDR side is a 512-bit line.
+	 * Write zero dwords before non-zero dwords within each DDR line so a
+	 * sparse-write implementation that temporarily drives zero on untouched
+	 * lanes cannot erase payload words written earlier in the line.
+	 */
+	while (pos < size) {
+		u32 line_rem = TMATMUL_DDR_PROBE_LINE_BYTES -
+			((offset + pos) & (TMATMUL_DDR_PROBE_LINE_BYTES - 1));
+		u32 line_len = min(line_rem, size - pos);
+		u32 phase;
+
+		for (phase = 0; phase < 2; phase++) {
+			u32 i;
+
+			for (i = 0; i < line_len; i += sizeof(u32)) {
+				u32 word;
+				int rc;
+
+				memcpy(&word, buf + pos + i, sizeof(word));
+				if ((word != 0) != phase)
+					continue;
+
+				rc = tmatmul_probe_write_dword(tmatmul,
+							       offset + pos + i,
+							       word);
+				if (rc)
+					return rc;
+			}
+		}
+
+		pos += line_len;
+	}
+
+	return 0;
+}
+
+static int tmatmul_mem_io_read(struct cxl_type2_tmatmul_dev *tmatmul,
+			       u64 offset, u8 *buf, u32 size)
+{
+	u32 pos;
+
+	for (pos = 0; pos < size; pos += sizeof(u32)) {
+		u32 word;
+		int rc = tmatmul_probe_read_dword(tmatmul, offset + pos, &word);
+
+		if (rc)
+			return rc;
+		memcpy(buf + pos, &word, sizeof(word));
+	}
+
+	return 0;
+}
+
+static int tmatmul_mem_io(struct cxl_type2_tmatmul_dev *tmatmul,
+			  struct cxl_type2_mem_req *req)
+{
+	void __user *uptr;
+	u8 *buf;
+	int rc;
+
+	if (req->flags || req->reserved0)
+		return -EINVAL;
+	if (!req->user_ptr)
+		return -EINVAL;
+	if (!req->size || req->size > CXL_TYPE2_MEM_REQ_MAX_BYTES)
+		return -EINVAL;
+	if (!IS_ALIGNED(req->offset, TMATMUL_DDR_PROBE_WORD_BYTES) ||
+	    !IS_ALIGNED(req->size, TMATMUL_DDR_PROBE_WORD_BYTES))
+		return -EINVAL;
+	if (req->offset > U32_MAX || req->size > U32_MAX - req->offset + 1)
+		return -ERANGE;
+	if (req->hpa_size && req->offset + req->size > req->hpa_size)
+		return -ERANGE;
+	if (req->op != CXL_TYPE2_MEM_REQ_READ &&
+	    req->op != CXL_TYPE2_MEM_REQ_WRITE)
+		return -EINVAL;
+
+	uptr = u64_to_user_ptr(req->user_ptr);
+	buf = kvzalloc(req->size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	if (req->op == CXL_TYPE2_MEM_REQ_WRITE) {
+		if (copy_from_user(buf, uptr, req->size)) {
+			rc = -EFAULT;
+			goto out;
+		}
+
+		mutex_lock(&tmatmul->lock);
+		rc = tmatmul_mem_io_write(tmatmul, req->offset, buf, req->size);
+		mutex_unlock(&tmatmul->lock);
+	} else {
+		mutex_lock(&tmatmul->lock);
+		rc = tmatmul_mem_io_read(tmatmul, req->offset, buf, req->size);
+		mutex_unlock(&tmatmul->lock);
+		if (rc)
+			goto out;
+		if (copy_to_user(uptr, buf, req->size))
+			rc = -EFAULT;
+	}
+
+out:
+	kvfree(buf);
+	return rc;
+}
+
 static long cxl_type2_tmatmul_ioctl(struct file *file, unsigned int cmd,
 				    unsigned long arg)
 {
@@ -153,6 +365,7 @@ static long cxl_type2_tmatmul_ioctl(struct file *file, unsigned int cmd,
 	void __user *argp = (void __user *)arg;
 	struct cxl_type2_tmatmul_info info;
 	struct cxl_type2_tmatmul_csr_run run;
+	struct cxl_type2_mem_req mem_req;
 	int rc;
 
 	switch (cmd) {
@@ -182,6 +395,11 @@ static long cxl_type2_tmatmul_ioctl(struct file *file, unsigned int cmd,
 		if (copy_to_user(argp, &run, sizeof(run)))
 			return -EFAULT;
 		return rc;
+
+	case CXL_TYPE2_MEM_IO:
+		if (copy_from_user(&mem_req, argp, sizeof(mem_req)))
+			return -EFAULT;
+		return tmatmul_mem_io(tmatmul, &mem_req);
 
 	default:
 		return -ENOTTY;
@@ -332,22 +550,23 @@ static void cxl_type2_enable_pf1(struct pci_dev *pf0)
  * Must run BEFORE devm_cxl_add_memdev so the endpoint port probe sees the
  * corrected ctrl state on its first read of the decoder.
  */
-static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
-				       u64 size)
+static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
+				      u64 size)
 {
 	struct cxl_register_map comp_map = {};
 	void __iomem *comp_base, *cap_base, *hdm_base = NULL;
-	u32 cap_hdr, global_ctrl, ctrl;
+	u64 rb_base, rb_size;
+	u32 cap_hdr, global_ctrl, ctrl, lo, hi;
 	int array_size, i, rc;
 
 	rc = cxl_find_regblock(pdev, CXL_REGLOC_RBI_COMPONENT, &comp_map);
 	if (rc || comp_map.resource == CXL_RESOURCE_NONE)
-		return;
+		return 0;
 
 	comp_base = devm_ioremap(&pdev->dev, comp_map.resource,
 				 comp_map.max_size);
 	if (IS_ERR_OR_NULL(comp_base))
-		return;
+		return -ENOMEM;
 
 	/* Walk CXL.cm capability array (block + 0x1000) to find HDM cap (id=5). */
 	cap_base = comp_base + 0x1000;
@@ -366,7 +585,7 @@ static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	if (!hdm_base) {
 		dev_warn(&pdev->dev,
 			 "HDM Decoder capability not found in component regs\n");
-		return;
+		return 0;
 	}
 
 	/* Enable HDM decoding globally (RMW to preserve other bits). */
@@ -399,10 +618,29 @@ static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	       hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
 	msleep(100);
 
+	global_ctrl = readl(hdm_base + CXL_HDM_DECODER_CTRL_OFFSET);
 	ctrl = readl(hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
+	lo = readl(hdm_base + CXL_HDM_DECODER0_BASE_LOW_OFFSET(0));
+	hi = readl(hdm_base + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(0));
+	rb_base = ((u64)hi << 32) | lo;
+	lo = readl(hdm_base + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0));
+	hi = readl(hdm_base + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0));
+	rb_size = ((u64)hi << 32) | lo;
+
 	dev_info(&pdev->dev,
-		 "HDM Decoder 0 force-committed: global_ctrl=0x%x ctrl=0x%x base=0x%llx size=0x%llx\n",
-		 global_ctrl, ctrl, base_pa, size);
+		 "HDM Decoder 0 force-commit readback: global_ctrl=0x%x ctrl=0x%x base=0x%llx size=0x%llx\n",
+		 global_ctrl, ctrl, rb_base, rb_size);
+
+	if (!(global_ctrl & CXL_HDM_DECODER_ENABLE) ||
+	    !(ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED) ||
+	    rb_base != base_pa || rb_size != size) {
+		dev_err(&pdev->dev,
+			"HDM Decoder 0 did not latch requested range base=0x%llx size=0x%llx; refusing unsafe memdev registration\n",
+			base_pa, size);
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -412,6 +650,8 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct cxl_dev_state *cxlds;
 	struct cxl_cachedev *cxlcd;
 	struct cxl_memdev *cxlmd;
+	enum cxl_type2_match_role match = id ? id->driver_data :
+		CXL_TYPE2_MATCH_GENERIC;
 	int rc;
 	u16 dvsec;
 
@@ -419,10 +659,24 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		 PCI_FUNC(pdev->devfn));
 
 	/*
-	 * IA-780I function 1 hosts the AFU side. Do not bind or touch its
-	 * BARs from this driver; PF1 setup is limited to explicit config-space
-	 * writes from user space.
+	 * IA-780I PF1 advertises the CXL memory-device class, but the FPGA
+	 * image exposes the CXL DVSEC/register-locator path through PF0. Bind
+	 * PF1 here as the board-specific AFU memory function so it is not left
+	 * driverless after generic cxl_pci rejects it for missing DVSEC. PF0
+	 * remains responsible for CXL register discovery, memdev registration,
+	 * and the tmatmul CSR miscdevice.
 	 */
+	if (match == CXL_TYPE2_MATCH_IA780I_MEM) {
+		rc = pcim_enable_device(pdev);
+		if (rc)
+			return rc;
+		pci_set_master(pdev);
+
+		dev_info(&pdev->dev,
+			 "IA-780I CXL memory-class PF bound; PF0 owns CXL DVSEC/register-locator handling\n");
+		return 0;
+	}
+
 	if (PCI_FUNC(pdev->devfn) != 0)
 		return -ENODEV;
 
@@ -471,6 +725,13 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	/* Check for CXL capabilities */
 	dvsec = cxlds->cxl_dvsec;
+	if (!dvsec &&
+	    cxlds->reg_map.resource != CXL_RESOURCE_NONE &&
+	    cxlds->reg_map.component_map.hdm_decoder.valid) {
+		cxlds->skip_dvsec_range_decode = true;
+		dev_warn(&pdev->dev,
+			 "CXL Device DVSEC missing; using component HDM decoder registers\n");
+	}
 	if (dvsec) {
 		u16 cap, ctrl;
 
@@ -498,8 +759,14 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 		/* CXL.cache */
 		if (cap & CXL_DVSEC_CACHE_CAPABLE) {
-			ctrl |= CXL_DVSEC_CACHE_ENABLE;
-			dev_info(&pdev->dev, "CXL.cache capable\n");
+			if (enable_cache) {
+				ctrl |= CXL_DVSEC_CACHE_ENABLE;
+				dev_info(&pdev->dev, "CXL.cache capable - enabling\n");
+			} else {
+				ctrl &= ~CXL_DVSEC_CACHE_ENABLE;
+				dev_info(&pdev->dev,
+					 "CXL.cache capable - disabled by enable_cache=0\n");
+			}
 		} else {
 			dev_warn(&pdev->dev, "Device does not have CXL.cache capability\n");
 		}
@@ -619,22 +886,39 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	pci_set_drvdata(pdev, cxlds);
 
-	/* Set cache state defaults for Type 2 accelerator */
-	cxlds->cstate.size = 128 * 1024 * 1024;  /* 128MB default cache */
-	cxlds->cstate.unit = 64;                  /* 64-byte cache lines */
-	cxlds->cstate.snoop_id = CXL_SNOOP_ID_NO_ID;
-	cxlds->cstate.cache_id = CXL_CACHE_ID_NO_ID;
-	dev_info(&pdev->dev, "Cache configured: %llu MB, %u-byte lines\n",
-		 cxlds->cstate.size / (1024 * 1024), cxlds->cstate.unit);
+	if (enable_cache) {
+		/* Set cache state defaults for Type 2 accelerator */
+		cxlds->cstate.size = 128 * 1024 * 1024;  /* 128MB default cache */
+		cxlds->cstate.unit = 64;                  /* 64-byte cache lines */
+		cxlds->cstate.snoop_id = CXL_SNOOP_ID_NO_ID;
+		cxlds->cstate.cache_id = CXL_CACHE_ID_NO_ID;
+		dev_info(&pdev->dev, "Cache configured: %llu MB, %u-byte lines\n",
+			 cxlds->cstate.size / (1024 * 1024), cxlds->cstate.unit);
 
-	/* Register as a CXL cache device */
-	cxlcd = devm_cxl_add_cachedev(&pdev->dev, cxlds);
-	if (IS_ERR(cxlcd)) {
-		rc = PTR_ERR(cxlcd);
-		dev_info(&pdev->dev, "Cache device registration: %d\n", rc);
-		/* Don't fail - device is still usable for MMIO testing */
+		/* Register as a CXL cache device */
+		cxlcd = devm_cxl_add_cachedev(&pdev->dev, cxlds);
+		if (IS_ERR(cxlcd)) {
+			rc = PTR_ERR(cxlcd);
+			dev_info(&pdev->dev, "Cache device registration: %d\n", rc);
+			/* Don't fail - device is still usable for CXL.mem / MMIO. */
+		} else {
+			dev_info(&pdev->dev, "CXL cache device registered successfully\n");
+		}
 	} else {
-		dev_info(&pdev->dev, "CXL cache device registered successfully\n");
+		dev_info(&pdev->dev,
+			 "CXL.cache registration skipped (enable_cache=0; CXL-Secured uses CXL.mem)\n");
+	}
+
+	if (!enable_memdev) {
+		dev_info(&pdev->dev,
+			 "CXL memdev/HDM/DAX registration skipped (enable_memdev=0; CSR-only boot-safe mode)\n");
+		rc = cxl_type2_tmatmul_init(pdev);
+		if (rc)
+			dev_warn(&pdev->dev, "tmatmul init failed: %d\n", rc);
+
+		dev_info(&pdev->dev,
+			 "CXL Type 2 Accelerator driver probed in CSR-only mode\n");
+		return 0;
 	}
 
 	/* Set device memory size (4GB, matches QEMU mem-size parameter) */
@@ -669,7 +953,22 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * target_list=50), and the standard cxl_region_attach() flow can
 	 * route this endpoint into the platform-managed Type-2 region.
 	 */
-	cxl_type2_force_commit_hdm(pdev, 0x180000000000ULL, mds->total_bytes);
+	rc = cxl_type2_force_commit_hdm(pdev, 0x180000000000ULL,
+					mds->total_bytes);
+	if (rc && !allow_uncommitted_hdm) {
+		dev_err(&pdev->dev,
+			"CXL memdev/HDM/DAX registration skipped after HDM commit failure (set allow_uncommitted_hdm=1 only for unsafe debug; do not online memory)\n");
+		rc = cxl_type2_tmatmul_init(pdev);
+		if (rc)
+			dev_warn(&pdev->dev, "tmatmul init failed: %d\n", rc);
+
+		dev_info(&pdev->dev,
+			 "CXL Type 2 Accelerator driver probed in CSR-only mode\n");
+		return 0;
+	}
+	if (rc)
+		dev_warn(&pdev->dev,
+			 "allow_uncommitted_hdm=1: registering memdev despite failed HDM commit; do not online memory\n");
 
 	/* Register as a CXL memory device for decoder/region/DAX flow */
 	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);
@@ -697,8 +996,26 @@ static void cxl_type2_remove(struct pci_dev *pdev)
 static const struct pci_device_id cxl_type2_pci_ids[] = {
 	/* QEMU CXL Type 2 device */
 	{ PCI_DEVICE(CXL_TYPE2_VENDOR_ID, CXL_TYPE2_DEVICE_ID_QEMU) },
-	/* Intel IA-780i Agilex 7 CXL Type 2 */
-	{ PCI_DEVICE(CXL_TYPE2_VENDOR_ID, CXL_TYPE2_DEVICE_ID_IA780I) },
+	/* Intel IA-780i Agilex 7 CXL Type 2 accelerator PF */
+	{
+		.vendor = CXL_TYPE2_VENDOR_ID,
+		.device = CXL_TYPE2_DEVICE_ID_IA780I,
+		.subvendor = PCI_ANY_ID,
+		.subdevice = PCI_ANY_ID,
+		.class = PCI_CLASS_ACCELERATOR_PROCESSING << 8,
+		.class_mask = 0xffffff,
+		.driver_data = CXL_TYPE2_MATCH_IA780I_ACCEL,
+	},
+	/* Intel IA-780i Agilex 7 CXL memory-class AFU PF */
+	{
+		.vendor = CXL_TYPE2_VENDOR_ID,
+		.device = CXL_TYPE2_DEVICE_ID_IA780I,
+		.subvendor = PCI_ANY_ID,
+		.subdevice = PCI_ANY_ID,
+		.class = PCI_CLASS_MEMORY_CXL << 8 | CXL_MEMORY_PROGIF,
+		.class_mask = 0xffffff,
+		.driver_data = CXL_TYPE2_MATCH_IA780I_MEM,
+	},
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, cxl_type2_pci_ids);

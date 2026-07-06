@@ -372,8 +372,10 @@ static bool can_create_ram(struct cxl_root_decoder *cxlrd)
 	unsigned long hdm_h = CXL_DECODER_F_HOSTONLY | CXL_DECODER_F_RAM;
 	unsigned long hdm_db = CXL_DECODER_F_DEVMEM | CXL_DECODER_F_BI |
 			       CXL_DECODER_F_RAM;
+	unsigned long hdm_d = CXL_DECODER_F_DEVMEM | CXL_DECODER_F_RAM;
 
-	return (flags & hdm_h) == hdm_h || (flags & hdm_db) == hdm_db;
+	return (flags & hdm_h) == hdm_h || (flags & hdm_db) == hdm_db ||
+	       (flags & hdm_d) == hdm_d;
 }
 
 static umode_t cxl_root_decoder_visible(struct kobject *kobj, struct attribute *a, int n)

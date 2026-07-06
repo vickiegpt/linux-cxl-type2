@@ -1108,6 +1108,26 @@ static int init_hdm_decoder(struct cxl_port *port, struct cxl_decoder *cxld,
 		return -ENODEV;
 	}
 
+	if (info && is_cxl_endpoint(port)) {
+		struct cxl_memdev *cxlmd;
+		struct cxl_dev_state *cxlds;
+
+		cxled = to_cxl_endpoint_decoder(&cxld->dev);
+		cxlmd = cxled_to_memdev(cxled);
+		cxlds = cxlmd->cxlds;
+		if (cxlds->skip_dvsec_range_decode &&
+		    cxlds->type == CXL_DEVTYPE_CLASSMEM) {
+			cxld->hpa_range = (struct range){ .start = 0, .end = -1 };
+			cxld->target_type = CXL_DECODER_DEVMEM;
+			cxld->commit = cxl_decoder_commit_soft;
+			cxld->reset = cxl_decoder_reset_soft;
+			cxled->state = CXL_DECODER_STATE_MANUAL;
+			dev_warn(&port->dev,
+				 "using software commit for Type-2 component HDM decoder\n");
+			return 0;
+		}
+	}
+
 	ctrl = readl(hdm + CXL_HDM_DECODER0_CTRL_OFFSET(which));
 	lo = readl(hdm + CXL_HDM_DECODER0_BASE_LOW_OFFSET(which));
 	hi = readl(hdm + CXL_HDM_DECODER0_BASE_HIGH_OFFSET(which));

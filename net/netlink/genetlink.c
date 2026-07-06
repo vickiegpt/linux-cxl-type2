@@ -26,9 +26,17 @@
 
 static DEFINE_MUTEX(genl_mutex); /* serialization of message processing */
 static DECLARE_RWSEM(cb_lock);
+static bool genl_relax_init;
 
 atomic_t genl_sk_destructing_cnt = ATOMIC_INIT(0);
 DECLARE_WAIT_QUEUE_HEAD(genl_sk_destructing_waitq);
+
+static int __init genl_relax_init_setup(char *str)
+{
+	genl_relax_init = true;
+	return 0;
+}
+early_param("genl_relax_init", genl_relax_init_setup);
 
 void genl_lock(void)
 {
@@ -783,8 +791,11 @@ int genl_register_family(struct genl_family *family)
 	int start = GENL_START_ALLOC, end = GENL_MAX_ID;
 
 	err = genl_validate_ops(family);
-	if (err)
+	if (err && !genl_relax_init)
 		return err;
+	if (err)
+		pr_warn("GENL: skipping ops validation failure for %s due to genl_relax_init=1: %d\n",
+			family->name, err);
 
 	genl_lock_all();
 
@@ -1913,8 +1924,11 @@ static int __init genl_init(void)
 	int err;
 
 	err = genl_register_family(&genl_ctrl);
-	if (err < 0)
+	if (err < 0 && !genl_relax_init)
 		goto problem;
+	if (err < 0)
+		pr_warn("GENL: continuing without ctrl family due to genl_relax_init=1: %d\n",
+			err);
 
 	err = register_pernet_subsys(&genl_pernet_ops);
 	if (err)
@@ -1923,6 +1937,11 @@ static int __init genl_init(void)
 	return 0;
 
 problem:
+	if (genl_relax_init) {
+		pr_warn("GENL: init failed, continuing due to genl_relax_init=1: %d\n",
+			err);
+		return err;
+	}
 	panic("GENL: Cannot register controller: %d\n", err);
 }
 
