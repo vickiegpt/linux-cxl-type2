@@ -4,26 +4,35 @@ Date: 2026-07-14
 
 ## Goal
 
-Recognize the reflashed CapCXL image from its PCI function signature and
+Recognize the reflashed CapCXL image from an explicit BAR identity and
 initialize PF0 as the Type-2 accelerator/control function and PF1 as the
 Type-3 memory function.
 
-The identifying signature is intentionally strict:
+The primary identity is exposed in the PF0 CAFU BAR window:
+
+- `BAR0 + 0x1c0ff0`: `CAPCXL_ID = 0x43415043584c0001`
+- `BAR0 + 0x1c0ff8`: capability bits
+  - bit 0: PF0 Type-2
+  - bit 1: PF1 Type-3
+  - bit 2: shared component registers
+  - bit 3: HDM1 remote memory
+
+The PCI signature is retained as a strict consistency check:
 
 - vendor/device: `8086:0ddb` on both functions
 - PF0: function 0, class `0x120000`, revision `0x02`
 - PF1: function 1, class `0x050210`, revision `0x01`
 
-All fields must match. Other `8086:0ddb` images retain their existing probe
-behavior.
+The BAR identity, required capability bits, and all PCI fields must match.
+Other `8086:0ddb` images retain their existing probe behavior.
 
 ## Considered approaches
 
-1. Use the PF class/revision pair. This works with the currently flashed image
-   and distinguishes it from the prior two-accelerator ternary/NIC image. This
-   is the selected approach.
-2. Add an explicit `CAPCXL` BAR magic register. This is more extensible but
-   requires another RTL build and reflash, so it is deferred.
+1. Add an explicit `CAPCXL` BAR identity and validate the PF class/revision
+   pair. This is robust across future image changes and is the selected
+   approach.
+2. Use only the PF class/revision pair. This works with the current image but
+   can collide with future images that reuse the same PCI configuration.
 3. Enable the existing PF0 memdev path globally. This is rejected because it
    misrepresents PF ownership and can affect non-CapCXL `0ddb` images.
 
@@ -53,9 +62,10 @@ Type-3 memdev under PF0.
 ## Probe coordination
 
 Either PF may be presented to the driver first. Detection therefore looks up
-the sibling function and validates the complete pair before selecting CapCXL
-mode. PF1 initialization discovers PF0 with `pci_get_slot()`, enables both
-functions as needed, and performs component register discovery through PF0.
+the sibling function, reads the identity from PF0, and validates the complete
+pair before selecting CapCXL mode. PF1 initialization discovers PF0 with
+`pci_get_slot()`, enables both functions as needed, and performs component
+register discovery through PF0.
 Any borrowed physical register resource is mapped with PF1-managed lifetime;
 the driver does not retain an uncounted PF0 pointer.
 
@@ -81,22 +91,29 @@ read/write routing has been proven without machine-check errors.
 ## Compatibility
 
 Existing QEMU, tmatmul, ternary, and NIC behavior remains unchanged unless the
-strict CapCXL signature matches. Existing module parameters remain available
-for those paths. CapCXL role selection is automatic once the pair matches; it
-does not depend on the global `enable_memdev` or `enable_cache` defaults.
+CapCXL BAR identity, capabilities, and strict PCI signature match. Existing
+module parameters remain available for those paths. CapCXL role selection is
+automatic once the identity matches; it does not depend on the global
+`enable_memdev` or `enable_cache` defaults.
 
 ## Verification
 
 The implementation will be test-first:
 
-1. Add a focused detector/role test covering exact match and every mismatch
-   dimension before adding production role selection.
-2. Build the CXL modules against the running `6.18.0-rc5` tree.
-3. Install and reload only the rebuilt CapCXL/CXL modules with
+1. Add an RTL test for identity, capabilities, component capability-array and
+   HDM decoder read/write behavior before changing the RTL.
+2. Extend focused RTL tests for CEU key/token/shadow/revoke and SAT entry
+   programming/readback.
+3. Add a driver detector/role test covering exact match, bad BAR identity,
+   missing capabilities, and every PCI mismatch before changing probe logic.
+4. Build the CXL modules against the running `6.18.0-rc5` tree.
+5. Generate a fresh SOF, reflash it, and verify the BAR identity before loading
+   the new driver.
+6. Install and reload only the rebuilt CapCXL/CXL modules with
    `cxl_acpi.rch_parent_uid=3`.
-4. Verify PF0 and PF1 driver binding, Type-2 cache registration, PF1 memdev and
+7. Verify PF0 and PF1 driver binding, Type-2 cache registration, PF1 memdev and
    endpoint creation, HDM commit readback, and absence of CXL/AER fatal errors.
-5. Stop before region creation, DAX reconfiguration, or memory online.
+8. Stop before region creation, DAX reconfiguration, or memory online.
 
 Success means PF0 is represented as Type-2, PF1 owns the Type-3 memdev, and
 the kernel log contains no legacy `TMM1` requirement or DVSEC range-decode
