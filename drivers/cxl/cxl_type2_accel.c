@@ -322,6 +322,65 @@ static void cxl_type2_enable_pf1(struct pci_dev *pf0)
 	pci_dev_put(pf1);
 }
 
+static u64 cxl_type2_qemu_mem_size(struct pci_dev *pdev, int dvsec)
+{
+	u64 capacity = 0;
+	int i;
+
+	for (i = 0; i < CXL_DVSEC_RANGE_MAX; i++) {
+		u64 size;
+		u32 high, low;
+
+		if (pci_read_config_dword(
+			    pdev, dvsec + CXL_DVSEC_RANGE_SIZE_HIGH(i), &high) ||
+		    pci_read_config_dword(
+			    pdev, dvsec + CXL_DVSEC_RANGE_SIZE_LOW(i), &low))
+			continue;
+		if (!(low & CXL_DVSEC_MEM_INFO_VALID))
+			continue;
+
+		size = (u64)high << 32;
+		size |= low & CXL_DVSEC_MEM_SIZE_LOW_MASK;
+		capacity = max(capacity, size);
+	}
+
+	return capacity;
+}
+
+static int cxl_type2_match_root_decoder(struct device *dev, const void *data)
+{
+	const u64 *capacity = data;
+	struct cxl_decoder *cxld;
+
+	if (!is_root_decoder(dev))
+		return 0;
+
+	cxld = to_cxl_decoder(dev);
+	return cxld->flags & CXL_DECODER_F_RAM &&
+	       range_len(&cxld->hpa_range) >= *capacity;
+}
+
+static int cxl_type2_qemu_hdm_range(struct pci_dev *pdev, u64 capacity,
+				    u64 *base, u64 *size)
+{
+	struct device *dev;
+	struct cxl_decoder *cxld;
+
+	dev = bus_find_device(&cxl_bus_type, NULL, &capacity,
+			      cxl_type2_match_root_decoder);
+	if (!dev)
+		return -ENODEV;
+
+	cxld = to_cxl_decoder(dev);
+	*base = cxld->hpa_range.start;
+	*size = min_t(u64, capacity, range_len(&cxld->hpa_range));
+	dev_info(&pdev->dev, "using %s HPA range %#llx-%#llx\n",
+		 dev_name(dev), *base, *base + *size - 1);
+	put_device(dev);
+
+	return 0;
+}
+
 /*
  * Force-commit Decoder 0 of the device's HDM block with the given HPA range.
  * Sets the HOSTONLY bit so the CXL core classifies the endpoint decoder as
@@ -369,6 +428,27 @@ static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 		return;
 	}
 
+	ctrl = readl(hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
+	if (ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED) {
+		u64 firmware_base;
+		u64 firmware_size;
+
+		firmware_base =
+			(u64)readl(hdm_base +
+				   CXL_HDM_DECODER0_BASE_HIGH_OFFSET(0)) << 32;
+		firmware_base |= readl(
+			hdm_base + CXL_HDM_DECODER0_BASE_LOW_OFFSET(0));
+		firmware_size =
+			(u64)readl(hdm_base +
+				   CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0)) << 32;
+		firmware_size |= readl(
+			hdm_base + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0));
+		dev_info(&pdev->dev,
+			 "preserving firmware HDM Decoder 0: base=0x%llx size=0x%llx ctrl=0x%x\n",
+			 firmware_base, firmware_size, ctrl);
+		return;
+	}
+
 	/* Enable HDM decoding globally (RMW to preserve other bits). */
 	global_ctrl = readl(hdm_base + CXL_HDM_DECODER_CTRL_OFFSET);
 	if (!(global_ctrl & CXL_HDM_DECODER_ENABLE)) {
@@ -412,6 +492,8 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct cxl_dev_state *cxlds;
 	struct cxl_cachedev *cxlcd;
 	struct cxl_memdev *cxlmd;
+	u64 hdm_base = 0x180000000000ULL;
+	u64 hdm_size = 4ULL * SZ_1G;
 	int rc;
 	u16 dvsec;
 
@@ -637,10 +719,23 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		dev_info(&pdev->dev, "CXL cache device registered successfully\n");
 	}
 
-	/* Set device memory size (4GB, matches QEMU mem-size parameter) */
-	mds->total_bytes = 4ULL * SZ_1G;
-	mds->volatile_only_bytes = 4ULL * SZ_1G;
-	mds->active_volatile_bytes = 4ULL * SZ_1G;
+	if (pdev->device == CXL_TYPE2_DEVICE_ID_QEMU) {
+		hdm_size = cxl_type2_qemu_mem_size(pdev, dvsec);
+		if (!hdm_size)
+			return dev_err_probe(&pdev->dev, -ENODEV,
+					     "QEMU DVSEC has no memory capacity\n");
+
+		rc = cxl_type2_qemu_hdm_range(pdev, hdm_size, &hdm_base,
+					      &hdm_size);
+		if (rc)
+			return dev_err_probe(&pdev->dev, rc,
+					     "no suitable CFMWS root decoder\n");
+
+	}
+
+	mds->total_bytes = hdm_size;
+	mds->volatile_only_bytes = hdm_size;
+	mds->active_volatile_bytes = hdm_size;
 
 	/* Set up DPA partitions (must happen before devm_cxl_add_memdev) */
 	{
@@ -661,15 +756,11 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * endpoint port probe (triggered inside devm_cxl_add_memdev) reads
 	 * a non-zero HPA range from the device.
 	 *
-	 * Use the IA-780I platform's CFMWS Type-2 window for this device's
-	 * host bridge (dport50): HPA 0x180000000000.  This must match the
-	 * BASE reset value in the FPGA bitstream's cafu_csr0_cfg_pkg.sv
-	 * (HDM_DEC_BASEHIGH_RESET=0x1800).  With the addresses aligned,
-	 * cxl_find_root_decoder() picks decoder0.12 (cap_type2=1,
-	 * target_list=50), and the standard cxl_region_attach() flow can
-	 * route this endpoint into the platform-managed Type-2 region.
+	 * Real IA-780I hardware retains its platform-specific default window.
+	 * The QEMU device instead derives capacity from DVSEC and selects the
+	 * first suitable CFMWS root decoder installed by ACPI.
 	 */
-	cxl_type2_force_commit_hdm(pdev, 0x180000000000ULL, mds->total_bytes);
+	cxl_type2_force_commit_hdm(pdev, hdm_base, hdm_size);
 
 	/* Register as a CXL memory device for decoder/region/DAX flow */
 	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);
