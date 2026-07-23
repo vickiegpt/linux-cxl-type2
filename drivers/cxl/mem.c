@@ -150,6 +150,13 @@ static int cxl_mem_probe(struct device *dev)
 		return rc;
 	}
 
+	/*
+	 * Firmware-committed decoders are enumerated synchronously when the
+	 * endpoint port is added. Defer region assembly until now so a
+	 * device-coherent CFMWS sees the final BI state.
+	 */
+	cxl_endpoint_discover_regions(cxlmd->endpoint);
+
 	rc = devm_cxl_memdev_edac_register(cxlmd);
 	if (rc)
 		dev_dbg(dev, "CXL memdev EDAC registration failed rc=%d\n", rc);

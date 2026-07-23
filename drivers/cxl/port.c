@@ -61,6 +61,11 @@ static int discover_region(struct device *dev, void *unused)
 	return 0;
 }
 
+void cxl_endpoint_discover_regions(struct cxl_port *endpoint)
+{
+	device_for_each_child(&endpoint->dev, NULL, discover_region);
+}
+
 static void cxl_port_map_bi(struct cxl_port *port)
 {
 	struct cxl_register_map *map = &port->reg_map;
@@ -131,12 +136,6 @@ static int cxl_mem_endpoint_port_probe(struct cxl_port *port)
 	rc = devm_cxl_endpoint_decoders_setup(port);
 	if (rc)
 		return rc;
-
-	/*
-	 * Now that all endpoint decoders are successfully enumerated, try to
-	 * assemble regions from committed decoders
-	 */
-	device_for_each_child(&port->dev, NULL, discover_region);
 
 	return 0;
 }
