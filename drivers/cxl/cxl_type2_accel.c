@@ -347,33 +347,129 @@ static u64 cxl_type2_qemu_mem_size(struct pci_dev *pdev, int dvsec)
 	return capacity;
 }
 
+struct cxl_type2_root_match {
+	struct device *host_bridge;
+	struct range firmware_range;
+	u64 capacity;
+	bool firmware_committed;
+};
+
 static int cxl_type2_match_root_decoder(struct device *dev, const void *data)
 {
-	const u64 *capacity = data;
+	const struct cxl_type2_root_match *match = data;
+	struct cxl_root_decoder *cxlrd;
 	struct cxl_decoder *cxld;
 
 	if (!is_root_decoder(dev))
 		return 0;
 
-	cxld = to_cxl_decoder(dev);
-	return cxld->flags & CXL_DECODER_F_RAM &&
-	       range_len(&cxld->hpa_range) >= *capacity;
+	cxlrd = to_cxl_root_decoder(dev);
+	cxld = &cxlrd->cxlsd.cxld;
+	if (!(cxld->flags & CXL_DECODER_F_RAM) ||
+	    cxld->target_type != CXL_DECODER_HOSTONLYMEM ||
+	    range_len(&cxld->hpa_range) < match->capacity)
+		return 0;
+	if (match->firmware_committed &&
+	    !range_contains(&cxld->hpa_range, &match->firmware_range))
+		return 0;
+
+	return cxl_root_decoder_targets(cxlrd, match->host_bridge);
+}
+
+static void __iomem *cxl_type2_hdm_base(struct pci_dev *pdev)
+{
+	struct cxl_register_map comp_map = {};
+	void __iomem *comp_base, *cap_base;
+	u32 cap_hdr;
+	int array_size, i, rc;
+
+	rc = cxl_find_regblock(pdev, CXL_REGLOC_RBI_COMPONENT, &comp_map);
+	if (rc || comp_map.resource == CXL_RESOURCE_NONE)
+		return ERR_PTR(-ENODEV);
+
+	comp_base = devm_ioremap(&pdev->dev, comp_map.resource,
+				 comp_map.max_size);
+	if (!comp_base)
+		return ERR_PTR(-ENOMEM);
+
+	cap_base = comp_base + 0x1000;
+	cap_hdr = readl(cap_base);
+	array_size = (cap_hdr >> 20) & 0xfff;
+	for (i = 0; i < array_size && i < 32; i++) {
+		u32 entry = readl(cap_base + 4 + i * 4);
+
+		if ((entry & 0xffff) == 5)
+			return cap_base + ((entry >> 20) & 0xfff);
+	}
+
+	return ERR_PTR(-ENODEV);
+}
+
+static int cxl_type2_read_committed_hdm(struct pci_dev *pdev, u64 *base,
+					u64 *size, u32 *ctrl)
+{
+	void __iomem *hdm_base;
+
+	hdm_base = cxl_type2_hdm_base(pdev);
+	if (IS_ERR(hdm_base))
+		return PTR_ERR(hdm_base);
+
+	*ctrl = readl(hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
+	if (!(*ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED))
+		return -ENOENT;
+
+	*base =
+		(u64)readl(hdm_base +
+			   CXL_HDM_DECODER0_BASE_HIGH_OFFSET(0)) << 32;
+	*base |= readl(hdm_base + CXL_HDM_DECODER0_BASE_LOW_OFFSET(0));
+	*size =
+		(u64)readl(hdm_base +
+			   CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0)) << 32;
+	*size |= readl(hdm_base + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0));
+
+	return 0;
 }
 
 static int cxl_type2_qemu_hdm_range(struct pci_dev *pdev, u64 capacity,
 				    u64 *base, u64 *size)
 {
+	struct pci_host_bridge *host = pci_find_host_bridge(pdev->bus);
+	struct cxl_type2_root_match match = {
+		.host_bridge = &host->dev,
+		.capacity = capacity,
+	};
 	struct device *dev;
 	struct cxl_decoder *cxld;
+	u32 ctrl;
+	int rc;
 
-	dev = bus_find_device(&cxl_bus_type, NULL, &capacity,
+	rc = cxl_type2_read_committed_hdm(pdev, &match.firmware_range.start,
+					  size, &ctrl);
+	if (!rc) {
+		if (!*size || *size != capacity ||
+		    match.firmware_range.start > U64_MAX - *size ||
+		    ctrl & CXL_HDM_DECODER0_CTRL_COMMIT_ERROR ||
+		    !(ctrl & CXL_HDM_DECODER0_CTRL_HOSTONLY))
+			return -EINVAL;
+		match.firmware_range.end =
+			match.firmware_range.start + *size - 1;
+		match.firmware_committed = true;
+	} else if (rc != -ENOENT) {
+		return rc;
+	}
+
+	dev = bus_find_device(&cxl_bus_type, NULL, &match,
 			      cxl_type2_match_root_decoder);
 	if (!dev)
 		return -ENODEV;
 
 	cxld = to_cxl_decoder(dev);
-	*base = cxld->hpa_range.start;
-	*size = min_t(u64, capacity, range_len(&cxld->hpa_range));
+	if (match.firmware_committed) {
+		*base = match.firmware_range.start;
+	} else {
+		*base = cxld->hpa_range.start;
+		*size = capacity;
+	}
 	dev_info(&pdev->dev, "using %s HPA range %#llx-%#llx\n",
 		 dev_name(dev), *base, *base + *size - 1);
 	put_device(dev);
@@ -391,42 +487,15 @@ static int cxl_type2_qemu_hdm_range(struct pci_dev *pdev, u64 capacity,
  * Must run BEFORE devm_cxl_add_memdev so the endpoint port probe sees the
  * corrected ctrl state on its first read of the decoder.
  */
-static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
-				       u64 size)
+static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
+				      u64 size)
 {
-	struct cxl_register_map comp_map = {};
-	void __iomem *comp_base, *cap_base, *hdm_base = NULL;
-	u32 cap_hdr, global_ctrl, ctrl;
-	int array_size, i, rc;
+	void __iomem *hdm_base;
+	u32 global_ctrl, ctrl;
 
-	rc = cxl_find_regblock(pdev, CXL_REGLOC_RBI_COMPONENT, &comp_map);
-	if (rc || comp_map.resource == CXL_RESOURCE_NONE)
-		return;
-
-	comp_base = devm_ioremap(&pdev->dev, comp_map.resource,
-				 comp_map.max_size);
-	if (IS_ERR_OR_NULL(comp_base))
-		return;
-
-	/* Walk CXL.cm capability array (block + 0x1000) to find HDM cap (id=5). */
-	cap_base = comp_base + 0x1000;
-	cap_hdr = readl(cap_base);
-	array_size = (cap_hdr >> 20) & 0xfff;
-	for (i = 0; i < array_size && i < 32; i++) {
-		u32 entry = readl(cap_base + 4 + i * 4);
-		u16 cap_id = entry & 0xffff;
-		u32 cap_off = (entry >> 20) & 0xfff;
-
-		if (cap_id == 5) {
-			hdm_base = cap_base + cap_off;
-			break;
-		}
-	}
-	if (!hdm_base) {
-		dev_warn(&pdev->dev,
-			 "HDM Decoder capability not found in component regs\n");
-		return;
-	}
+	hdm_base = cxl_type2_hdm_base(pdev);
+	if (IS_ERR(hdm_base))
+		return PTR_ERR(hdm_base);
 
 	ctrl = readl(hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
 	if (ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED) {
@@ -443,10 +512,18 @@ static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 				   CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0)) << 32;
 		firmware_size |= readl(
 			hdm_base + CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0));
+		if (pdev->device == CXL_TYPE2_DEVICE_ID_QEMU &&
+		    (firmware_base != base_pa || firmware_size != size ||
+		     ctrl & CXL_HDM_DECODER0_CTRL_COMMIT_ERROR ||
+		     !(ctrl & CXL_HDM_DECODER0_CTRL_HOSTONLY)))
+			return dev_err_probe(
+				&pdev->dev, -EINVAL,
+				"inconsistent firmware HDM Decoder 0: base=%#llx size=%#llx ctrl=%#x\n",
+				firmware_base, firmware_size, ctrl);
 		dev_info(&pdev->dev,
 			 "preserving firmware HDM Decoder 0: base=0x%llx size=0x%llx ctrl=0x%x\n",
 			 firmware_base, firmware_size, ctrl);
-		return;
+		return 0;
 	}
 
 	/* Enable HDM decoding globally (RMW to preserve other bits). */
@@ -475,7 +552,9 @@ static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	writel(upper_32_bits(size),
 	       hdm_base + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0));
 
-	writel(CXL_HDM_DECODER0_CTRL_COMMIT,
+	writel(CXL_HDM_DECODER0_CTRL_COMMIT |
+	       (pdev->device == CXL_TYPE2_DEVICE_ID_QEMU ?
+		CXL_HDM_DECODER0_CTRL_HOSTONLY : 0),
 	       hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
 	msleep(100);
 
@@ -483,6 +562,11 @@ static void cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	dev_info(&pdev->dev,
 		 "HDM Decoder 0 force-committed: global_ctrl=0x%x ctrl=0x%x base=0x%llx size=0x%llx\n",
 		 global_ctrl, ctrl, base_pa, size);
+	if (!(ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED) ||
+	    ctrl & CXL_HDM_DECODER0_CTRL_COMMIT_ERROR)
+		return -EIO;
+
+	return 0;
 }
 
 static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -760,7 +844,10 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * The QEMU device instead derives capacity from DVSEC and selects the
 	 * first suitable CFMWS root decoder installed by ACPI.
 	 */
-	cxl_type2_force_commit_hdm(pdev, hdm_base, hdm_size);
+	rc = cxl_type2_force_commit_hdm(pdev, hdm_base, hdm_size);
+	if (rc)
+		return dev_err_probe(&pdev->dev, rc,
+				     "failed to establish HDM Decoder 0\n");
 
 	/* Register as a CXL memory device for decoder/region/DAX flow */
 	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);

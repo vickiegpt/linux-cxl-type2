@@ -65,6 +65,7 @@ void cxl_endpoint_discover_regions(struct cxl_port *endpoint)
 {
 	device_for_each_child(&endpoint->dev, NULL, discover_region);
 }
+EXPORT_SYMBOL_NS_GPL(cxl_endpoint_discover_regions, "CXL");
 
 static void cxl_port_map_bi(struct cxl_port *port)
 {

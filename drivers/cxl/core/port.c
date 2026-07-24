@@ -478,6 +478,22 @@ struct cxl_root_decoder *to_cxl_root_decoder(struct device *dev)
 }
 EXPORT_SYMBOL_NS_GPL(to_cxl_root_decoder, "CXL");
 
+bool cxl_root_decoder_targets(struct cxl_root_decoder *cxlrd,
+			      struct device *dport_dev)
+{
+	struct cxl_switch_decoder *cxlsd = &cxlrd->cxlsd;
+	int i;
+
+	guard(rwsem_read)(&cxl_rwsem.region);
+	for (i = 0; i < cxlsd->nr_targets; i++)
+		if (cxlsd->target[i] &&
+		    cxlsd->target[i]->dport_dev == dport_dev)
+			return true;
+
+	return false;
+}
+EXPORT_SYMBOL_NS_GPL(cxl_root_decoder_targets, "CXL");
+
 static void cxl_root_decoder_release(struct device *dev)
 {
 	struct cxl_root_decoder *cxlrd = to_cxl_root_decoder(dev);
