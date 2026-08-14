@@ -1494,6 +1494,7 @@ static struct dev_dax *__devm_create_dev_dax(struct dev_dax_data *data)
 	ida_init(&dev_dax->ida);
 
 	dev_dax->memmap_on_memory = data->memmap_on_memory;
+	dev_dax->persistent = data->persistent;
 
 	inode = dax_inode(dax_dev);
 	dev->devt = inode->i_rdev;

@@ -75,6 +75,8 @@ struct dev_dax_range {
  * @ida: mapping id allocator
  * @dev - device core
  * @pgmap - pgmap for memmap setup / lifetime (driver owned)
+ * @kaddr - kernel mapping used to flush persistent device-dax ranges
+ * @persistent - whether fsync must flush this device's persistence domain
  * @nr_range: size of @ranges
  * @ranges: range tuples of memory used
  */
@@ -88,6 +90,8 @@ struct dev_dax {
 	struct ida ida;
 	struct device dev;
 	struct dev_pagemap *pgmap;
+	void *kaddr;
+	bool persistent;
 	bool memmap_on_memory;
 	int nr_range;
 	struct dev_dax_range *ranges;

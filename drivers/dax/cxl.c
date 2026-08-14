@@ -28,6 +28,7 @@ static int cxl_dax_region_probe(struct device *dev)
 		.id = -1,
 		.size = range_len(&cxlr_dax->hpa_range),
 		.memmap_on_memory = true,
+		.persistent = true,
 	};
 
 	dev_dax = devm_create_dev_dax(&data);

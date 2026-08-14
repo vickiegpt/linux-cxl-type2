@@ -371,11 +371,32 @@ static int dax_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static int dax_fsync(struct file *filp, loff_t start, loff_t end,
+		     int datasync)
+{
+	struct dev_dax *dev_dax = filp->private_data;
+	resource_size_t size;
+
+	if (!dev_dax->persistent || !dev_dax->kaddr || dev_dax->nr_range != 1)
+		return -EINVAL;
+	if (start < 0 || end < start)
+		return -EINVAL;
+
+	size = range_len(&dev_dax->ranges[0].range);
+	if (end >= size)
+		return -EINVAL;
+
+	dax_flush(dev_dax->dax_dev, dev_dax->kaddr + start,
+		  end - start + 1);
+	return 0;
+}
+
 static const struct file_operations dax_fops = {
 	.llseek = noop_llseek,
 	.owner = THIS_MODULE,
 	.open = dax_open,
 	.release = dax_release,
+	.fsync = dax_fsync,
 	.get_unmapped_area = dax_get_unmapped_area,
 	.mmap = dax_mmap,
 	.fop_flags = FOP_MMAP_SYNC,
@@ -450,6 +471,9 @@ static int dev_dax_probe(struct dev_dax *dev_dax)
 	if (IS_ERR(addr))
 		return dev_err_probe(dev, PTR_ERR(addr),
 				     "failed to map device-dax pages\n");
+	dev_dax->kaddr = addr;
+	if (dev_dax->persistent)
+		dax_write_cache(dax_dev, true);
 
 	inode = dax_inode(dax_dev);
 	cdev = inode->i_cdev;
