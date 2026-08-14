@@ -38,6 +38,18 @@
  */
 static nodemask_t nodemask_region_seen = NODE_MASK_NONE;
 
+/*
+ * Experimental full-system test hook for persistent CXL media that must be
+ * consumed through /dev/dax without carrying ndctl into an initramfs.  The
+ * default remains the standard libnvdimm PMEM path.  Enabling this parameter
+ * changes only the Linux consumer for an already committed PMEM region; it
+ * does not change the endpoint media type or its persistence semantics.
+ */
+static bool cxl_pmem_as_dax;
+module_param_named(pmem_as_dax, cxl_pmem_as_dax, bool, 0444);
+MODULE_PARM_DESC(pmem_as_dax,
+		 "Expose committed CXL PMEM regions as device-dax (experimental)");
+
 static struct cxl_region *to_cxl_region(struct device *dev);
 
 #define __ACCESS_ATTR_RO(_level, _name) {				\
@@ -3997,6 +4009,12 @@ static int cxl_region_probe(struct device *dev)
 		if (rc)
 			dev_dbg(&cxlr->dev, "CXL EDAC registration for region_id=%d failed\n",
 				cxlr->id);
+
+		if (cxl_pmem_as_dax) {
+			dev_info(&cxlr->dev,
+				 "routing persistent region to device-dax by request\n");
+			return devm_cxl_add_dax_region(cxlr);
+		}
 
 		return devm_cxl_add_pmem_region(cxlr);
 	case CXL_PARTMODE_RAM:
