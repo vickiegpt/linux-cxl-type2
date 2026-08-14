@@ -13,6 +13,7 @@ static int cxl_dax_region_probe(struct device *dev)
 	struct cxl_region *cxlr = cxlr_dax->cxlr;
 	struct dax_region *dax_region;
 	struct dev_dax_data data;
+	struct dev_dax *dev_dax;
 
 	if (nid == NUMA_NO_NODE)
 		nid = memory_add_physaddr_to_nid(cxlr_dax->hpa_range.start);
@@ -29,7 +30,11 @@ static int cxl_dax_region_probe(struct device *dev)
 		.memmap_on_memory = true,
 	};
 
-	return PTR_ERR_OR_ZERO(devm_create_dev_dax(&data));
+	dev_dax = devm_create_dev_dax(&data);
+	if (IS_ERR(dev_dax))
+		return dev_err_probe(dev, PTR_ERR(dev_dax),
+				     "failed to create device-dax for CXL region\n");
+	return 0;
 }
 
 static struct cxl_driver cxl_dax_region_driver = {

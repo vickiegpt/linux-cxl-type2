@@ -448,7 +448,8 @@ static int dev_dax_probe(struct dev_dax *dev_dax)
 			order_base_2(dev_dax->align >> PAGE_SHIFT);
 	addr = devm_memremap_pages(dev, pgmap);
 	if (IS_ERR(addr))
-		return PTR_ERR(addr);
+		return dev_err_probe(dev, PTR_ERR(addr),
+				     "failed to map device-dax pages\n");
 
 	inode = dax_inode(dax_dev);
 	cdev = inode->i_cdev;
