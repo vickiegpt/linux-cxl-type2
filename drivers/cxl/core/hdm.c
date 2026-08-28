@@ -95,6 +95,8 @@ static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
 {
 	struct cxl_hdm *cxlhdm;
 	void __iomem *hdm;
+	struct cxl_memdev *cxlmd;
+	struct cxl_dev_state *cxlds;
 	u32 ctrl;
 	int i;
 
@@ -103,6 +105,13 @@ static bool should_emulate_decoders(struct cxl_endpoint_dvsec_info *info)
 
 	cxlhdm = dev_get_drvdata(&info->port->dev);
 	hdm = cxlhdm->regs.hdm_decoder;
+
+	if (is_cxl_endpoint(info->port)) {
+		cxlmd = to_cxl_memdev(info->port->uport_dev);
+		cxlds = cxlmd->cxlds;
+		if (cxlds->dvsec_hdm_devmem)
+			return info->ranges > 0;
+	}
 
 	if (!hdm)
 		return info->ranges > 0;
@@ -1022,6 +1031,8 @@ static int cxl_setup_hdm_decoder_from_dvsec(
 	int which, struct cxl_endpoint_dvsec_info *info)
 {
 	struct cxl_endpoint_decoder *cxled;
+	struct cxl_memdev *cxlmd;
+	struct cxl_dev_state *cxlds;
 	u64 len;
 	int rc;
 
@@ -1029,11 +1040,14 @@ static int cxl_setup_hdm_decoder_from_dvsec(
 		return -EOPNOTSUPP;
 
 	cxled = to_cxl_endpoint_decoder(&cxld->dev);
+	cxlmd = cxled_to_memdev(cxled);
+	cxlds = cxlmd->cxlds;
 	len = range_len(&info->dvsec_range[which]);
 	if (!len)
 		return -ENOENT;
 
-	cxld->target_type = CXL_DECODER_HOSTONLYMEM;
+	cxld->target_type = cxlds->dvsec_hdm_devmem ?
+		CXL_DECODER_DEVMEM : CXL_DECODER_HOSTONLYMEM;
 	cxld->commit = NULL;
 	cxld->reset = NULL;
 	cxld->hpa_range = info->dvsec_range[which];
@@ -1116,14 +1130,15 @@ static int init_hdm_decoder(struct cxl_port *port, struct cxl_decoder *cxld,
 		cxlmd = cxled_to_memdev(cxled);
 		cxlds = cxlmd->cxlds;
 		if (cxlds->skip_dvsec_range_decode &&
-		    cxlds->type == CXL_DEVTYPE_CLASSMEM) {
+		    cxlds->type == CXL_DEVTYPE_CLASSMEM &&
+		    cxlds->hostonly_hdm_decoder) {
 			cxld->hpa_range = (struct range){ .start = 0, .end = -1 };
-			cxld->target_type = CXL_DECODER_DEVMEM;
+			cxld->target_type = CXL_DECODER_HOSTONLYMEM;
 			cxld->commit = cxl_decoder_commit_soft;
 			cxld->reset = cxl_decoder_reset_soft;
 			cxled->state = CXL_DECODER_STATE_MANUAL;
 			dev_warn(&port->dev,
-				 "using software commit for Type-2 component HDM decoder\n");
+				 "using software commit for Type-3 component HDM decoder\n");
 			return 0;
 		}
 	}
@@ -1421,6 +1436,14 @@ int devm_cxl_endpoint_decoders_setup(struct cxl_port *port)
 			dev_warn(&port->dev,
 				 "DVSEC range decode failed: %d; using component HDM decoder registers\n",
 				 rc);
+			rc = 0;
+		} else if (cxlds->skip_dvsec_range_decode &&
+			   cxlds->hostonly_hdm_decoder &&
+			   cxlds->type == CXL_DEVTYPE_CLASSMEM) {
+			info.mem_enabled = true;
+			info.hdm_count = 1;
+			dev_warn(&port->dev,
+				 "using one software host-only decoder without DVSEC\n");
 			rc = 0;
 		} else {
 			dev_err(&port->dev, "DVSEC range decode failed: %d\n", rc);

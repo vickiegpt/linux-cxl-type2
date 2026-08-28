@@ -1798,11 +1798,17 @@ static int cmp_interleave_pos(const void *a, const void *b)
 	return cxled_a->pos - cxled_b->pos;
 }
 
+struct match_switch_decoder_ctx {
+	struct range *range;
+	struct cxl_dport *dport;
+};
+
 static int match_switch_decoder_by_range(struct device *dev,
 					 const void *data)
 {
+	const struct match_switch_decoder_ctx *ctx = data;
 	struct cxl_switch_decoder *cxlsd;
-	const struct range *r1, *r2 = data;
+	const struct range *r1, *r2 = ctx->range;
 
 
 	if (!is_switch_decoder(dev))
@@ -1811,8 +1817,15 @@ static int match_switch_decoder_by_range(struct device *dev,
 	cxlsd = to_cxl_switch_decoder(dev);
 	r1 = &cxlsd->cxld.hpa_range;
 
-	if (is_root_decoder(dev))
-		return range_contains(r1, r2);
+	if (is_root_decoder(dev)) {
+		if (!range_contains(r1, r2))
+			return 0;
+
+		for (int i = 0; i < cxlsd->cxld.interleave_ways; i++)
+			if (cxlsd->target[i] == ctx->dport)
+				return 1;
+		return 0;
+	}
 	return (r1->start == r2->start && r1->end == r2->end);
 }
 
@@ -1820,6 +1833,7 @@ static int find_pos_and_ways(struct cxl_port *port, struct range *range,
 			     int *pos, int *ways)
 {
 	struct cxl_switch_decoder *cxlsd;
+	struct match_switch_decoder_ctx ctx;
 	struct cxl_port *parent;
 	struct device *dev;
 	int rc = -ENXIO;
@@ -1828,7 +1842,11 @@ static int find_pos_and_ways(struct cxl_port *port, struct range *range,
 	if (!parent)
 		return rc;
 
-	dev = device_find_child(&parent->dev, range,
+	ctx = (struct match_switch_decoder_ctx) {
+		.range = range,
+		.dport = port->parent_dport,
+	};
+	dev = device_find_child(&parent->dev, &ctx,
 				match_switch_decoder_by_range);
 	if (!dev) {
 		dev_err(port->uport_dev,
@@ -3506,11 +3524,13 @@ cxl_port_find_switch_decoder(struct cxl_port *port, struct range *hpa)
 struct match_decoder_ctx {
 	struct range *hpa;
 	enum cxl_decoder_type target_type;
+	struct cxl_dport *dport;
 };
 
 static int match_decoder_by_range_and_type(struct device *dev, const void *data)
 {
 	const struct match_decoder_ctx *ctx = data;
+	struct cxl_switch_decoder *cxlsd;
 	struct cxl_decoder *cxld;
 	const struct range *r1;
 
@@ -3519,8 +3539,20 @@ static int match_decoder_by_range_and_type(struct device *dev, const void *data)
 
 	cxld = to_cxl_decoder(dev);
 	r1 = &cxld->hpa_range;
-	return range_contains(r1, ctx->hpa) &&
-	       cxld->target_type == ctx->target_type;
+	if (!range_contains(r1, ctx->hpa) ||
+	    cxld->target_type != ctx->target_type)
+		return 0;
+
+	if (ctx->dport) {
+		cxlsd = to_cxl_switch_decoder(dev);
+
+		for (int i = 0; i < cxld->interleave_ways; i++)
+			if (cxlsd->target[i] == ctx->dport)
+				return 1;
+		return 0;
+	}
+
+	return 1;
 }
 
 static struct cxl_root_decoder *
@@ -3531,12 +3563,17 @@ cxl_find_root_decoder(struct cxl_endpoint_decoder *cxled)
 	struct cxl_root *cxl_root __free(put_cxl_root) = find_cxl_root(port);
 	struct cxl_decoder *root, *cxld = &cxled->cxld;
 	struct range *hpa = &cxld->hpa_range;
+	struct match_decoder_ctx ctx;
+	struct cxl_dport *dport;
 	struct device *cxld_dev;
 
-	/* Prefer a root decoder matching the endpoint's target type */
-	struct match_decoder_ctx ctx = {
+	dport = cxl_find_dport_by_dev(&cxl_root->port, port->host_bridge);
+
+	/* Prefer a root decoder matching the endpoint's type and topology. */
+	ctx = (struct match_decoder_ctx) {
 		.hpa = hpa,
 		.target_type = cxld->target_type,
+		.dport = dport,
 	};
 	cxld_dev = device_find_child(&cxl_root->port.dev, &ctx,
 				     match_decoder_by_range_and_type);

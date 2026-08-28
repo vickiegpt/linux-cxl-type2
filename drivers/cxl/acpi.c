@@ -16,9 +16,16 @@ static u64 rch_hpa_base = 0x180000000000ULL;
 module_param(rch_hpa_base, ullong, 0644);
 MODULE_PARM_DESC(rch_hpa_base, "HPA base for synthetic RCH CXL window");
 
-static u64 rch_hpa_size = 0x400000000ULL; /* 16GB */
+/* Firmware CFMWS is authoritative; synthetic windows are opt-in diagnostics. */
+static u64 rch_hpa_size;
 module_param(rch_hpa_size, ullong, 0644);
-MODULE_PARM_DESC(rch_hpa_size, "Size of synthetic RCH CXL window");
+MODULE_PARM_DESC(rch_hpa_size,
+		 "Size of synthetic RCH CXL window (0 disables injection)");
+
+static u64 rch_force_ram_hpa_base;
+module_param(rch_force_ram_hpa_base, ullong, 0644);
+MODULE_PARM_DESC(rch_force_ram_hpa_base,
+		 "Reclassify the firmware CFMWS at this exact HPA base as volatile RAM");
 
 /*
  * When an RCH device is physically downstream of a VH host bridge,
@@ -482,6 +489,14 @@ static int __cxl_parse_cfmws(struct acpi_cedt_cfmws *cfmws,
 
 	cxld = &cxlrd->cxlsd.cxld;
 	cxld->flags = cfmws_to_decoder_flags(cfmws->restrictions);
+	if (rch_force_ram_hpa_base &&
+	    cfmws->base_hpa == rch_force_ram_hpa_base) {
+		cxld->flags &= ~CXL_DECODER_F_PMEM;
+		cxld->flags |= CXL_DECODER_F_RAM;
+		dev_warn(ctx->dev,
+			 "CFMWS at HPA %#llx reclassified from PMEM to volatile RAM\n",
+			 cfmws->base_hpa);
+	}
 	cxld->target_type = (cxld->flags & CXL_DECODER_F_DEVMEM) ?
 		CXL_DECODER_DEVMEM : CXL_DECODER_HOSTONLYMEM;
 	cxld->hpa_range = (struct range) {
@@ -656,6 +671,53 @@ static int cxl_get_chbs(struct device *dev, struct acpi_device *hb,
 	return 0;
 }
 
+struct cxl_cfmws_target_context {
+	u32 uid;
+	bool found;
+};
+
+static int cxl_match_cfmws_target(union acpi_subtable_headers *header,
+				  void *arg, const unsigned long end)
+{
+	struct cxl_cfmws_target_context *ctx = arg;
+	struct acpi_cedt_cfmws *cfmws;
+	unsigned int ways, i;
+
+	if (ctx->found)
+		return 0;
+
+	cfmws = (struct acpi_cedt_cfmws *)header;
+	if (eiw_to_ways(cfmws->interleave_ways, &ways))
+		return 0;
+	if (cfmws->header.length <
+	    struct_size(cfmws, interleave_targets, ways))
+		return 0;
+
+	for (i = 0; i < ways; i++) {
+		if (cfmws->interleave_targets[i] == ctx->uid) {
+			ctx->found = true;
+			break;
+		}
+	}
+
+	return 0;
+}
+
+static bool cxl_uid_is_cfmws_target(unsigned long long uid)
+{
+	struct cxl_cfmws_target_context ctx;
+
+	if (uid > INT_MAX)
+		return false;
+
+	ctx = (struct cxl_cfmws_target_context) {
+		.uid = uid,
+	};
+	acpi_table_parse_cedt(ACPI_CEDT_TYPE_CFMWS,
+			      cxl_match_cfmws_target, &ctx);
+	return ctx.found;
+}
+
 static int get_genport_coordinates(struct device *dev, struct cxl_dport *dport)
 {
 	struct acpi_device *hb = to_cxl_host_bridge(NULL, dev);
@@ -751,8 +813,35 @@ static int add_host_bridge_dport(struct device *match, void *arg)
 	}
 
 	if (ctx.cxl_version == UINT_MAX) {
-		dev_warn(match, "No CHBS found for Host Bridge (UID %lld)\n",
-			 ctx.uid);
+		if (!cxl_uid_is_cfmws_target(ctx.uid)) {
+			dev_warn(match,
+				 "No CHBS found for Host Bridge (UID %lld)\n",
+				 ctx.uid);
+			return 0;
+		}
+
+		pci_root = acpi_pci_find_root(hb->handle);
+		if (!pci_root) {
+			dev_warn(match,
+				 "No PCI root for native CFMWS target UID %lld\n",
+				 ctx.uid);
+			return 0;
+		}
+		bridge = pci_root->bus->bridge;
+		dport = devm_cxl_add_dport(root_port, bridge, ctx.uid,
+					   CXL_RESOURCE_NONE);
+		if (IS_ERR(dport))
+			return PTR_ERR(dport);
+
+		ret = get_genport_coordinates(match, dport);
+		if (ret)
+			dev_dbg(match,
+				"Failed to get generic port coordinates for native CFMWS target UID %lld\n",
+				ctx.uid);
+
+		dev_info(match,
+			 "Native CFMWS target UID %lld (%s) registered without CHBS/RCRB\n",
+			 ctx.uid, dev_name(bridge));
 		return 0;
 	}
 
@@ -895,6 +984,13 @@ static int add_host_bridge_uport(struct device *match, void *arg)
 	rc = cxl_get_chbs(match, hb, &ctx);
 	if (rc)
 		return rc;
+
+	if (ctx.cxl_version == UINT_MAX &&
+	    cxl_uid_is_cfmws_target(ctx.uid)) {
+		dev_info(bridge,
+			 "host supports CXL (restricted, native CFMWS target without CHBS)\n");
+		return 0;
+	}
 
 	if (ctx.cxl_version == ACPI_CEDT_CHBS_VERSION_CXL11) {
 		dev_warn(bridge,
@@ -1094,12 +1190,9 @@ static int check_dport_has_decoder(struct device *dev, void *data)
  * @ctx: CFMWS context (for id counter)
  * @host: device for devm allocations
  *
- * When rch_parent_uid is set, the synthetic decoder targets the VH parent
- * dport instead of the RCH dport.  This is needed when an RCH device is
- * physically downstream of a VH host bridge (e.g. IA-780i: bus 3b RCH
- * is physically under bus 14 VH).  The CPU's SAD already routes HPA
- * traffic to the VH root port, which physically connects to the RCH
- * device, so the decoder must target the VH dport for CXL.mem to work.
+ * When explicitly enabled, the synthetic decoder targets the VH parent dport
+ * instead of the RCH dport. This only models Linux topology; it does not
+ * program CPU SAD routing, so the selected HPA must already be host-routable.
  */
 static void cxl_inject_synthetic_cfmws(struct cxl_port *root_port,
 					struct resource *cxl_res,

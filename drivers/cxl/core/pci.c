@@ -386,6 +386,12 @@ int cxl_hdm_decode_init(struct cxl_dev_state *cxlds, struct cxl_hdm *cxlhdm,
 
 	if (hdm)
 		global_ctrl = readl(hdm + CXL_HDM_DECODER_CTRL_OFFSET);
+	if (!hdm && cxlds->skip_dvsec_range_decode &&
+	    cxlds->hostonly_hdm_decoder) {
+		dev_warn(dev,
+			 "host-only decoder needs no DVSEC enable write\n");
+		return 0;
+	}
 
 	/*
 	 * If the HDM Decoder Capability is already enabled then assume

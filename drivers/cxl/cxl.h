@@ -903,6 +903,10 @@ struct cxl_cache_state {
  * @hdmd: Whether this device is using HDM-D flows
  * @skip_dvsec_range_decode: Trust component HDM registers when CXL Device DVSEC
  *			    range/capability fields are unusable
+ * @hostonly_hdm_decoder: Treat a software-committed component HDM decoder as
+ *			  host-only memory rather than Type-2 device memory
+ * @dvsec_hdm_devmem: Model the endpoint from active DVSEC ranges as Type-2
+ *		      device memory, ignoring stale component HDM state
  * @bi: Whether this device has BI requests enabled
  * @dpa_res: Overall DPA resource tree for the device
  * @part: DPA partition array
@@ -924,6 +928,8 @@ struct cxl_dev_state {
 	bool media_ready;
 	bool hdmd;
 	bool skip_dvsec_range_decode;
+	bool hostonly_hdm_decoder;
+	bool dvsec_hdm_devmem;
 	bool bi;
 	struct resource dpa_res;
 	struct cxl_dpa_partition part[CXL_NR_PARTITIONS_MAX];

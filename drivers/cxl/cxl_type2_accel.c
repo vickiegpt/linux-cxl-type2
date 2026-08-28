@@ -11,9 +11,12 @@
 #include <linux/delay.h>
 #include <linux/compat.h>
 #include <linux/fs.h>
+#include <linux/iopoll.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
 #include <linux/uaccess.h>
@@ -23,10 +26,17 @@
 #include "cxlpci.h"
 #include "cxlcache.h"
 #include "cxl.h"
+#include "capcxl_identity.h"
+#include "tmatmul_identity.h"
 
 #define CXL_TYPE2_VENDOR_ID	0x8086
 #define CXL_TYPE2_DEVICE_ID_QEMU	0x0d92
 #define CXL_TYPE2_DEVICE_ID_IA780I	0x0ddb
+
+#define CAPCXL_ID_OFFSET		0x1c0ff0
+#define CAPCXL_ID_MAP_SIZE		0x10
+#define CAPCXL_HPA_BASE		0x180000000000ULL
+#define CAPCXL_MEMORY_SIZE		(4ULL * SZ_1G)
 
 enum cxl_type2_match_role {
 	CXL_TYPE2_MATCH_GENERIC,
@@ -34,7 +44,7 @@ enum cxl_type2_match_role {
 	CXL_TYPE2_MATCH_IA780I_MEM,
 };
 
-#define TMATMUL_DEV_ID			0x544D4D31 /* "TMM1" */
+#define TMATMUL_DEV_ID			TMATMUL_ID_VALUE
 #define TMATMUL_CSR_BASE		0x1C0000
 #define TMATMUL_CSR_SIZE		0x2000
 #define TMATMUL_INSTANCE_BASE		0x100
@@ -63,16 +73,21 @@ enum cxl_type2_match_role {
 #define TMATMUL_INST_STALL_STATUS	0x00
 #define TMATMUL_INST_STALL_CLEAR	0x04
 #define TMATMUL_INST_RST_TRIGGER	0x08
+#define TMATMUL_INST_RST_STATUS		0x0C
 #define TMATMUL_INST_INSTR_SRC_LO	0x10
 #define TMATMUL_INST_INSTR_SRC_HI	0x14
 #define TMATMUL_INST_INSTR_LEN		0x18
 #define TMATMUL_INST_INSTR_START	0x1C
 #define TMATMUL_INST_DBG_INSTR_CNT	0x40
+#define TMATMUL_INST_EXEC_STATUS	0x60
 
 #define TMATMUL_DMA_IDLE		0x00
 #define TMATMUL_DMA_RUNNING		0x01
 #define TMATMUL_DMA_DONE		0x02
 #define TMATMUL_DMA_ERROR		0xFF
+
+#define TMATMUL_DDR_INSTR_DPA_DEFAULT	0x00600000ULL
+#define TMATMUL_PROGRAM_BYTES		(8 * 16)
 
 static bool enable_cache;
 module_param(enable_cache, bool, 0644);
@@ -89,14 +104,632 @@ module_param(allow_uncommitted_hdm, bool, 0644);
 MODULE_PARM_DESC(allow_uncommitted_hdm,
 		 "Allow memdev registration when HDM commit readback fails (unsafe; default false)");
 
+static unsigned long long type2_hpa_base = CAPCXL_HPA_BASE;
+module_param(type2_hpa_base, ullong, 0644);
+MODULE_PARM_DESC(type2_hpa_base,
+		 "HPA base programmed into the generic Type-2 endpoint HDM decoder");
+
+static bool use_dvsec_hdm = true;
+module_param(use_dvsec_hdm, bool, 0644);
+MODULE_PARM_DESC(use_dvsec_hdm,
+		 "Model Type-2 memory from active DVSEC ranges instead of component HDM registers");
+
+static unsigned long long tmatmul_program_dpa =
+	TMATMUL_DDR_INSTR_DPA_DEFAULT;
+module_param(tmatmul_program_dpa, ullong, 0444);
+MODULE_PARM_DESC(tmatmul_program_dpa,
+		 "DPA of the fixed 128-byte RUN_CSR_ONLY instruction program");
+
+static int type2_parse_capacity(struct cxl_memdev_state *mds,
+				const struct cxl_mbox_identify *id)
+{
+	struct device *dev = mds->cxlds.dev;
+	u64 total_units = le64_to_cpu(id->total_capacity);
+	u64 volatile_units = le64_to_cpu(id->volatile_capacity);
+	u64 persistent_units = le64_to_cpu(id->persistent_capacity);
+	u64 align_units = le64_to_cpu(id->partition_align);
+	u64 total, volatile_bytes, persistent, align, partitioned;
+
+	if (!total_units || total_units == U64_MAX ||
+	    volatile_units == U64_MAX || persistent_units == U64_MAX ||
+	    align_units == U64_MAX) {
+		dev_err(dev,
+			"invalid Identify capacity: total=%#llx volatile=%#llx persistent=%#llx align=%#llx (256 MiB units)\n",
+			total_units, volatile_units, persistent_units,
+			align_units);
+		return -EINVAL;
+	}
+
+	if (check_mul_overflow(total_units, CXL_CAPACITY_MULTIPLIER,
+			       &total) ||
+	    check_mul_overflow(volatile_units, CXL_CAPACITY_MULTIPLIER,
+			       &volatile_bytes) ||
+	    check_mul_overflow(persistent_units, CXL_CAPACITY_MULTIPLIER,
+			       &persistent) ||
+	    check_mul_overflow(align_units, CXL_CAPACITY_MULTIPLIER,
+			       &align)) {
+		dev_err(dev,
+			"Identify capacity overflows bytes: total=%#llx volatile=%#llx persistent=%#llx align=%#llx\n",
+			total_units, volatile_units, persistent_units,
+			align_units);
+		return -EOVERFLOW;
+	}
+
+	if ((!volatile_bytes && !persistent) ||
+	    volatile_bytes > total || persistent > total ||
+	    check_add_overflow(volatile_bytes, persistent, &partitioned) ||
+	    partitioned > total) {
+		dev_err(dev,
+			"inconsistent Identify capacity: total=%#llx volatile=%#llx persistent=%#llx bytes\n",
+			total, volatile_bytes, persistent);
+		return -EINVAL;
+	}
+
+	mds->total_bytes = total;
+	mds->volatile_only_bytes = volatile_bytes;
+	mds->persistent_only_bytes = persistent;
+	mds->active_volatile_bytes = volatile_bytes;
+	mds->active_persistent_bytes = persistent;
+	mds->partition_align_bytes = align;
+	memcpy(mds->firmware_version, id->fw_revision,
+	       sizeof(id->fw_revision));
+
+	dev_info(dev,
+		 "mailbox Identify capacity: total=%#llx volatile=%#llx persistent=%#llx bytes\n",
+		 total, volatile_bytes, persistent);
+	return 0;
+}
+
+static int type2_read_dvsec_range(struct cxl_memdev_state *mds,
+				  u64 *mapped_base, u64 *capacity)
+{
+	struct cxl_dev_state *cxlds = &mds->cxlds;
+	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
+	u64 first_base = 0, next_base = 0, total = 0;
+	bool found = false;
+	int i;
+
+	if (!cxlds->cxl_dvsec) {
+		dev_err(cxlds->dev,
+			"CXL Device DVSEC is missing; capacity cannot be verified\n");
+		return -ENODEV;
+	}
+
+	for (i = 0; i < CXL_DVSEC_RANGE_MAX; i++) {
+		u64 base, end, size;
+		u32 base_high, base_low, size_high, size_low;
+
+		if (pci_read_config_dword(pdev, cxlds->cxl_dvsec +
+					 CXL_DVSEC_RANGE_SIZE_HIGH(i),
+					 &size_high) ||
+		    pci_read_config_dword(pdev, cxlds->cxl_dvsec +
+					 CXL_DVSEC_RANGE_SIZE_LOW(i),
+					 &size_low) ||
+		    pci_read_config_dword(pdev, cxlds->cxl_dvsec +
+					 CXL_DVSEC_RANGE_BASE_HIGH(i),
+					 &base_high) ||
+		    pci_read_config_dword(pdev, cxlds->cxl_dvsec +
+					 CXL_DVSEC_RANGE_BASE_LOW(i),
+					 &base_low))
+			return -EIO;
+
+		if (!(size_low & CXL_DVSEC_MEM_INFO_VALID))
+			continue;
+
+		size = ((u64)size_high << 32) |
+		       (size_low & CXL_DVSEC_MEM_SIZE_LOW_MASK);
+		if (!size) {
+			dev_err(cxlds->dev,
+				"DVSEC range %d is valid but advertises zero capacity (high=%#x low=%#x)\n",
+				i, size_high, size_low);
+			return -EINVAL;
+		}
+
+		base = ((u64)base_high << 32) |
+		       (base_low & CXL_DVSEC_MEM_BASE_LOW_MASK);
+		if (!base) {
+			dev_err(cxlds->dev,
+				"DVSEC range %d is valid but has no programmed HPA base\n",
+				i);
+			return -EINVAL;
+		}
+		if (check_add_overflow(base, size, &end))
+			return -EOVERFLOW;
+
+		if (!found)
+			first_base = base;
+		else if (base != next_base) {
+			dev_err(cxlds->dev,
+				"DVSEC ranges are not contiguous: range %d starts at %#llx, expected %#llx\n",
+				i, base, next_base);
+			return -EINVAL;
+		}
+
+		if (check_add_overflow(total, size, &total))
+			return -EOVERFLOW;
+		next_base = end;
+		found = true;
+	}
+
+	if (!found) {
+		dev_err(cxlds->dev,
+			"CXL Device DVSEC has no valid memory range\n");
+		return -ENODEV;
+	}
+
+	*mapped_base = first_base;
+	*capacity = total;
+	return 0;
+}
+
+static int type2_read_identify(struct cxl_memdev_state *mds,
+			       struct cxl_mbox_identify *id)
+{
+	struct cxl_dev_state *cxlds = &mds->cxlds;
+	struct device *dev = cxlds->dev;
+	void __iomem *mbox = cxlds->regs.mbox;
+	void __iomem *memdev = cxlds->regs.memdev;
+	u64 md_status, cmd_reg, status_reg;
+	u32 cap, ctrl, payload_exp;
+	size_t payload_size, out_len;
+	u16 return_code;
+	int rc;
+
+	if (!mbox || !memdev) {
+		dev_err(dev,
+			"memory-device mailbox registers are not mapped\n");
+		return -ENODEV;
+	}
+
+	md_status = readq(memdev + CXLMDEV_STATUS_OFFSET);
+	if ((md_status & (CXLMDEV_DEV_FATAL | CXLMDEV_FW_HALT)) ||
+	    !CXLMDEV_READY(md_status) ||
+	    !(md_status & CXLMDEV_MBOX_IF_READY)) {
+		dev_err(dev,
+			"memory device is not ready for Identify (status=%#llx)\n",
+			md_status);
+		return -ENODEV;
+	}
+
+	cap = readl(mbox + CXLDEV_MBOX_CAPS_OFFSET);
+	payload_exp = FIELD_GET(CXLDEV_MBOX_CAP_PAYLOAD_SIZE_MASK, cap);
+	payload_size = 1ULL << payload_exp;
+	if (payload_size < sizeof(*id)) {
+		dev_err(dev,
+			"mailbox payload is too small for Identify (%zu bytes)\n",
+			payload_size);
+		return -ENXIO;
+	}
+
+	rc = readl_poll_timeout(mbox + CXLDEV_MBOX_CTRL_OFFSET, ctrl,
+				!(ctrl & CXLDEV_MBOX_CTRL_DOORBELL),
+				1000, 2 * 1000 * 1000);
+	if (rc) {
+		dev_err(dev, "timeout waiting for mailbox idle\n");
+		return rc;
+	}
+
+	cmd_reg = FIELD_PREP(CXLDEV_MBOX_CMD_COMMAND_OPCODE_MASK,
+			     CXL_MBOX_OP_IDENTIFY);
+	writeq(cmd_reg, mbox + CXLDEV_MBOX_CMD_OFFSET);
+	writel(CXLDEV_MBOX_CTRL_DOORBELL,
+	       mbox + CXLDEV_MBOX_CTRL_OFFSET);
+
+	rc = readl_poll_timeout(mbox + CXLDEV_MBOX_CTRL_OFFSET, ctrl,
+				!(ctrl & CXLDEV_MBOX_CTRL_DOORBELL),
+				1000, 2 * 1000 * 1000);
+	if (rc) {
+		dev_err(dev, "mailbox Identify timed out\n");
+		return rc;
+	}
+
+	status_reg = readq(mbox + CXLDEV_MBOX_STATUS_OFFSET);
+	return_code = FIELD_GET(CXLDEV_MBOX_STATUS_RET_CODE_MASK, status_reg);
+	if ((status_reg & CXLDEV_MBOX_STATUS_BG_CMD) ||
+	    return_code != CXL_MBOX_CMD_RC_SUCCESS) {
+		dev_err(dev,
+			"mailbox Identify failed (status=%#llx return_code=%u)\n",
+			status_reg, return_code);
+		return -EIO;
+	}
+
+	cmd_reg = readq(mbox + CXLDEV_MBOX_CMD_OFFSET);
+	out_len = FIELD_GET(CXLDEV_MBOX_CMD_PAYLOAD_LENGTH_MASK, cmd_reg);
+	if (out_len < sizeof(*id) || out_len > payload_size) {
+		dev_err(dev,
+			"mailbox Identify returned invalid payload length %zu\n",
+			out_len);
+		return -EPROTO;
+	}
+
+	memcpy_fromio(id, mbox + CXLDEV_MBOX_PAYLOAD_OFFSET, sizeof(*id));
+	return 0;
+}
+
+static int cxl_type2_identify_capacity(struct cxl_memdev_state *mds,
+					u64 *mapped_base,
+					u64 *mapped_capacity)
+{
+	struct cxl_mbox_identify first = {};
+	struct cxl_mbox_identify second = {};
+	u64 dvsec_capacity, active_capacity;
+	int rc;
+
+	rc = type2_read_identify(mds, &first);
+	if (rc)
+		return rc;
+
+	rc = type2_read_identify(mds, &second);
+	if (rc)
+		return rc;
+
+	if (memcmp(&first, &second, sizeof(first))) {
+		dev_err(mds->cxlds.dev,
+			"mailbox Identify payload is not repeatable; refusing capacity discovery\n");
+		return -EIO;
+	}
+
+	rc = type2_parse_capacity(mds, &first);
+	if (rc)
+		return rc;
+
+	rc = type2_read_dvsec_range(mds, mapped_base, &dvsec_capacity);
+	if (rc)
+		return rc;
+
+	if (check_add_overflow(mds->active_volatile_bytes,
+			       mds->active_persistent_bytes,
+			       &active_capacity))
+		return -EOVERFLOW;
+
+	/*
+	 * Identify reports installed media, while the active DVSEC ranges
+	 * describe the subset currently mapped into HPA space.
+	 */
+	if (dvsec_capacity > active_capacity) {
+		dev_err(mds->cxlds.dev,
+			"DVSEC capacity %#llx exceeds active mailbox capacity %#llx bytes\n",
+			dvsec_capacity, active_capacity);
+		return -EINVAL;
+	}
+	if (dvsec_capacity != mds->total_bytes)
+		dev_info(mds->cxlds.dev,
+			 "active DVSEC maps %#llx of %#llx mailbox bytes\n",
+			 dvsec_capacity, mds->total_bytes);
+
+	*mapped_capacity = dvsec_capacity;
+	mds->cxlds.media_ready = true;
+	return 0;
+}
+
+#define TYPE2_MAX_SOFT_RESERVED_RANGES	8
+
+struct type2_soft_reserved_range {
+	resource_size_t start;
+	resource_size_t end;
+	unsigned long flags;
+	unsigned long desc;
+	struct resource *parent;
+};
+
+struct type2_soft_reserved_scan {
+	struct type2_soft_reserved_range range[TYPE2_MAX_SOFT_RESERVED_RANGES];
+	unsigned int nr;
+};
+
+struct type2_soft_reserved_merge {
+	struct device *dev;
+	struct resource *parent;
+	struct resource wrapper;
+	struct resource *original[TYPE2_MAX_SOFT_RESERVED_RANGES];
+	unsigned int nr_original;
+	unsigned int nr_removed;
+	bool inserted;
+};
+
+static DEFINE_MUTEX(type2_resource_fixup_lock);
+
+static int type2_collect_soft_reserved(struct resource *res, void *data)
+{
+	struct type2_soft_reserved_scan *scan = data;
+	struct type2_soft_reserved_range *range;
+
+	if (scan->nr == ARRAY_SIZE(scan->range))
+		return -E2BIG;
+
+	range = &scan->range[scan->nr++];
+	range->start = res->start;
+	range->end = res->end;
+	range->flags = res->flags;
+	range->desc = res->desc;
+	range->parent = res->parent;
+	return 0;
+}
+
+static int
+type2_reinsert_soft_reserved_locked(struct type2_soft_reserved_merge *merge)
+{
+	int first_rc = 0;
+	unsigned int i;
+
+	for (i = 0; i < merge->nr_removed; i++) {
+		struct resource *res = merge->original[i];
+		int rc;
+
+		if (res->parent == &merge->wrapper)
+			continue;
+		if (res->parent) {
+			dev_crit(merge->dev,
+				 "Soft Reserved resource %pR was unexpectedly reparented\n",
+				 res);
+			if (!first_rc)
+				first_rc = -EBUSY;
+			continue;
+		}
+
+		rc = request_resource(&merge->wrapper, res);
+		if (rc) {
+			dev_crit(merge->dev,
+				 "failed to restore Soft Reserved resource %pR: %d\n",
+				 res, rc);
+			if (!first_rc)
+				first_rc = rc;
+		}
+	}
+
+	return first_rc;
+}
+
+static int type2_remove_wrapper_locked(struct type2_soft_reserved_merge *merge)
+{
+	int rc;
+
+	if (!merge->inserted)
+		return 0;
+
+	rc = type2_reinsert_soft_reserved_locked(merge);
+	if (rc)
+		return rc;
+
+	rc = remove_resource(&merge->wrapper);
+	if (rc)
+		return rc;
+
+	merge->inserted = false;
+	return 0;
+}
+
+static int
+__type2_restore_soft_reserved(struct type2_soft_reserved_merge *merge)
+{
+	int rc;
+
+	if (!merge->inserted)
+		return 0;
+
+	if (merge->wrapper.parent != merge->parent ||
+	    merge->wrapper.child) {
+		dev_err(merge->dev,
+			"cannot restore split Soft Reserved resources while normalized range is owned or reparented\n");
+		return -EBUSY;
+	}
+
+	rc = type2_remove_wrapper_locked(merge);
+	if (rc)
+		return rc;
+
+	dev_info(merge->dev,
+		 "restored %u split Soft Reserved resources after DAX teardown\n",
+		 merge->nr_original);
+	kfree(merge);
+	return 0;
+}
+
+static void type2_restore_soft_reserved(void *data)
+{
+	struct type2_soft_reserved_merge *merge = data;
+	int rc;
+
+	mutex_lock(&type2_resource_fixup_lock);
+	rc = __type2_restore_soft_reserved(merge);
+	if (rc)
+		dev_crit(merge->dev,
+			 "leaving normalized Soft Reserved resource allocated after teardown failure: %d\n",
+			 rc);
+	mutex_unlock(&type2_resource_fixup_lock);
+}
+
+static int type2_coalesce_soft_reserved(struct device *dev, u64 mapped_base,
+					 u64 mapped_capacity)
+{
+	struct type2_soft_reserved_scan scan = {};
+	struct type2_soft_reserved_merge *merge;
+	struct resource *parent;
+	struct resource *res;
+	resource_size_t start, end;
+	unsigned int i;
+	u64 end64;
+	int rc;
+
+	if (!mapped_capacity || mapped_capacity > SIZE_MAX ||
+	    check_add_overflow(mapped_base, mapped_capacity - 1, &end64) ||
+	    (u64)(resource_size_t)mapped_base != mapped_base ||
+	    (u64)(resource_size_t)end64 != end64)
+		return -EOVERFLOW;
+
+	start = mapped_base;
+	end = end64;
+
+	mutex_lock(&type2_resource_fixup_lock);
+
+	rc = region_intersects(start, mapped_capacity, IORESOURCE_SYSTEM_RAM,
+			       IORES_DESC_NONE);
+	if (rc != REGION_DISJOINT) {
+		dev_err(dev,
+			"refusing DVSEC resource fixup: System RAM intersects %pa-%pa\n",
+			&start, &end);
+		rc = -EBUSY;
+		goto out_unlock;
+	}
+
+	rc = walk_iomem_res_desc(IORES_DESC_SOFT_RESERVED, IORESOURCE_MEM,
+				 start, end, &scan,
+				 type2_collect_soft_reserved);
+	if (rc && (scan.nr || rc != -EINVAL)) {
+		dev_err(dev,
+			"failed to enumerate Soft Reserved resources for %pa-%pa: %d\n",
+			&start, &end, rc);
+		goto out_unlock;
+	}
+	if (!scan.nr) {
+		rc = 0;
+		goto out_unlock;
+	}
+
+	if (scan.range[0].start != start ||
+	    scan.range[scan.nr - 1].end != end) {
+		dev_err(dev,
+			"Soft Reserved resources do not cover the complete DVSEC range %pa-%pa\n",
+			&start, &end);
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+
+	for (i = 0; i < scan.nr; i++) {
+		struct type2_soft_reserved_range *range = &scan.range[i];
+
+		if (range->desc != IORES_DESC_SOFT_RESERVED ||
+		    (range->flags & IORESOURCE_TYPE_BITS) != IORESOURCE_MEM ||
+		    (range->flags & IORESOURCE_BUSY) ||
+		    !range->parent ||
+		    (i && (scan.range[i - 1].end == RESOURCE_SIZE_MAX ||
+			   scan.range[i - 1].end + 1 != range->start)) ||
+		    (i && (range->flags != scan.range[0].flags ||
+			   range->desc != scan.range[0].desc ||
+			   range->parent != scan.range[0].parent))) {
+			dev_err(dev,
+				"DVSEC Soft Reserved resources are not safe, identical, and contiguous\n");
+			rc = -EINVAL;
+			goto out_unlock;
+		}
+	}
+
+	parent = scan.range[0].parent;
+	if (parent->start != start || parent->end != end ||
+	    resource_type(parent) != IORESOURCE_MEM ||
+	    parent->desc != IORES_DESC_CXL ||
+	    (parent->flags & IORESOURCE_BUSY)) {
+		rc = -EINVAL;
+		dev_err(dev,
+			"no exact non-busy CXL window owns DVSEC range %pa-%pa: %d\n",
+			&start, &end, rc);
+		goto out_unlock;
+	}
+
+	if (scan.nr == 1) {
+		rc = 0;
+		goto out_unlock;
+	}
+
+	merge = kzalloc(sizeof(*merge), GFP_KERNEL);
+	if (!merge) {
+		rc = -ENOMEM;
+		goto out_unlock;
+	}
+	merge->dev = dev;
+	merge->parent = parent;
+	merge->wrapper = (struct resource) {
+		.name = "CXL Type-2 normalized Soft Reserved",
+		.start = start,
+		.end = end,
+		.flags = scan.range[0].flags,
+		.desc = IORES_DESC_SOFT_RESERVED,
+	};
+
+	rc = insert_resource(parent, &merge->wrapper);
+	if (rc) {
+		dev_err(dev,
+			"failed to insert normalized Soft Reserved resource: %d\n",
+			rc);
+		kfree(merge);
+		goto out_unlock;
+	}
+	merge->inserted = true;
+
+	res = merge->wrapper.child;
+	for (i = 0; i < scan.nr; i++) {
+		struct type2_soft_reserved_range *range = &scan.range[i];
+
+		if (!res || res->parent != &merge->wrapper ||
+		    res->start != range->start || res->end != range->end ||
+		    res->flags != range->flags || res->desc != range->desc ||
+		    res->child) {
+			dev_err(dev,
+				"Soft Reserved resource %u changed or has an active child; refusing fixup\n",
+				i);
+			rc = -EBUSY;
+			goto rollback;
+		}
+		merge->original[merge->nr_original++] = res;
+		res = res->sibling;
+	}
+	if (res) {
+		dev_err(dev,
+			"normalized Soft Reserved resource captured unexpected children\n");
+		rc = -EBUSY;
+		goto rollback;
+	}
+
+	for (i = 0; i < merge->nr_original; i++) {
+		rc = remove_resource(merge->original[i]);
+		if (rc)
+			goto rollback;
+		merge->nr_removed++;
+	}
+
+	if (merge->wrapper.child) {
+		rc = -EAGAIN;
+		goto rollback;
+	}
+
+	rc = devm_add_action(dev, type2_restore_soft_reserved, merge);
+	if (rc) {
+		int restore_rc = __type2_restore_soft_reserved(merge);
+
+		if (restore_rc)
+			dev_crit(dev,
+				 "failed to restore resources after devres registration error: %d\n",
+				 restore_rc);
+		goto out_unlock;
+	}
+
+	dev_info(dev,
+		 "coalesced %u adjacent Soft Reserved resources into %pR for native DVSEC DAX\n",
+		 scan.nr, &merge->wrapper);
+	rc = 0;
+	goto out_unlock;
+
+rollback:
+	{
+		int restore_rc = type2_remove_wrapper_locked(merge);
+
+		if (restore_rc)
+			dev_crit(dev,
+				 "Soft Reserved rollback was incomplete: %d\n",
+				 restore_rc);
+		else
+			kfree(merge);
+	}
+out_unlock:
+	mutex_unlock(&type2_resource_fixup_lock);
+	return rc;
+}
+
 /*
  * Userspace places its instruction program at this device-physical-address
  * offset within the dax window.  The driver only needs to point the CSR
  * fetch engine at it; the actual bytes are written by userspace.
  */
-#define TMATMUL_DDR_INSTR_DPA		0x00300000ULL
-#define TMATMUL_PROGRAM_BYTES		(6 * 16)
-
 struct cxl_type2_tmatmul_dev {
 	struct pci_dev *pdev;
 	void __iomem *csr;
@@ -125,9 +758,15 @@ static int tmatmul_launch_csr_only(struct cxl_type2_tmatmul_dev *tmatmul,
 	unsigned long deadline;
 	u32 timeout_ms = run->timeout_ms ?: 5000;
 	u32 num_instances;
+	u32 instr_before;
+	u32 status;
 	int rc = 0;
 
 	if (run->flags)
+		return -EINVAL;
+
+	if (!IS_ALIGNED(tmatmul_program_dpa, 64) ||
+	    tmatmul_program_dpa > U64_MAX - TMATMUL_PROGRAM_BYTES)
 		return -EINVAL;
 
 	num_instances = tmatmul_rd32(tmatmul, TMATMUL_REG_NUM_INSTANCES);
@@ -138,14 +777,68 @@ static int tmatmul_launch_csr_only(struct cxl_type2_tmatmul_dev *tmatmul,
 
 	mutex_lock(&tmatmul->lock);
 
+	status = tmatmul_rd32(tmatmul,
+			      tmatmul_inst_off(0, TMATMUL_INST_RST_STATUS));
+	if (status & 0x1) {
+		rc = -EBUSY;
+		goto out_unlock;
+	}
+
+	/*
+	 * Do not pulse the per-instance reset between runs. The FPGA's
+	 * toggle-based instr_dma_start synchronizer resets only its destination
+	 * state on an instance reset; its CSR-source toggle remains live. After
+	 * the first launch, resetting only the destination synthesizes a second
+	 * edge and replays the previous DMA descriptor.
+	 *
+	 * A cold engine is (IDLE, not stalled), while a completed engine is
+	 * (DONE, stalled). Reject every other combination. The instruction
+	 * counter is cumulative without a reset, so report the per-run delta.
+	 */
+	status = tmatmul_rd32(tmatmul,
+			      tmatmul_inst_off(0, TMATMUL_INST_EXEC_STATUS));
+	if (status) {
+		rc = -EIO;
+		goto out_unlock;
+	}
+
+	status = tmatmul_rd32(tmatmul,
+			      tmatmul_inst_off(0, TMATMUL_INST_INSTR_START)) & 0xff;
+	if (status == TMATMUL_DMA_IDLE) {
+		if (tmatmul_rd32(tmatmul,
+				tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS))) {
+			rc = -EIO;
+			goto out_unlock;
+		}
+	} else if (status == TMATMUL_DMA_DONE) {
+		if (!tmatmul_rd32(tmatmul,
+				 tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS))) {
+			rc = -EBUSY;
+			goto out_unlock;
+		}
+	} else if (status == TMATMUL_DMA_RUNNING) {
+		rc = -EBUSY;
+		goto out_unlock;
+	} else {
+		rc = -EIO;
+		goto out_unlock;
+	}
+
+	instr_before = tmatmul_rd32(tmatmul,
+				   tmatmul_inst_off(0,
+						    TMATMUL_INST_DBG_INSTR_CNT));
+
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_STALL_CLEAR), 1);
-	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_RST_TRIGGER), 1);
-	msleep(50);
+	rc = readl_poll_timeout(tmatmul->csr +
+			tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS),
+			status, !status, 10, 100000);
+	if (rc)
+		goto out_unlock;
 
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_SRC_LO),
-		     lower_32_bits(TMATMUL_DDR_INSTR_DPA));
+		     lower_32_bits(tmatmul_program_dpa));
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_SRC_HI),
-		     upper_32_bits(TMATMUL_DDR_INSTR_DPA));
+		     upper_32_bits(tmatmul_program_dpa));
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_LEN),
 		     TMATMUL_PROGRAM_BYTES);
 	tmatmul_wr32(tmatmul, tmatmul_inst_off(0, TMATMUL_INST_INSTR_START), 1);
@@ -156,8 +849,9 @@ static int tmatmul_launch_csr_only(struct cxl_type2_tmatmul_dev *tmatmul,
 			tmatmul_inst_off(0, TMATMUL_INST_INSTR_START)) & 0xff;
 		run->stall_status = tmatmul_rd32(tmatmul,
 			tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS));
-		run->instr_count = tmatmul_rd32(tmatmul,
-			tmatmul_inst_off(0, TMATMUL_INST_DBG_INSTR_CNT));
+		status = tmatmul_rd32(tmatmul,
+				      tmatmul_inst_off(0, TMATMUL_INST_DBG_INSTR_CNT));
+		run->instr_count = status - instr_before;
 
 		if (run->stall_status) {
 			run->result_flags |= CXL_TYPE2_TMATMUL_RESULT_STALLED;
@@ -406,10 +1100,75 @@ static long cxl_type2_tmatmul_ioctl(struct file *file, unsigned int cmd,
 	}
 }
 
+static int cxl_type2_tmatmul_release(struct inode *inode, struct file *file)
+{
+	struct miscdevice *miscdev = file->private_data;
+	struct cxl_type2_tmatmul_dev *tmatmul =
+		container_of(miscdev, struct cxl_type2_tmatmul_dev, miscdev);
+	u32 dma_status, exec_status, instr_count, reset_status, stall_status;
+	const u32 rearm_period = 2 * (TMATMUL_PROGRAM_BYTES / 16);
+	int rc;
+
+	mutex_lock(&tmatmul->lock);
+	reset_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_RST_STATUS));
+	exec_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_EXEC_STATUS));
+	dma_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_INSTR_START)) & 0xff;
+	stall_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS));
+	instr_count = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_DBG_INSTR_CNT));
+
+	/*
+	 * The start synchronizer uses a source-domain toggle. Resetting after an
+	 * odd launch count clears only the destination toggle and fabricates a
+	 * second start edge. After an even number of complete 8-slot programs,
+	 * both toggles are zero again, so an instance reset is safe and rearms
+	 * the engine for the next control-device session.
+	 *
+	 * Never reset a running, partial, errored, or otherwise ambiguous state.
+	 * That preserves the fail-closed recovery boundary after a timeout.
+	 */
+	if (!reset_status && !exec_status &&
+	    dma_status == TMATMUL_DMA_DONE && stall_status &&
+	    instr_count && !(instr_count % rearm_period)) {
+		tmatmul_wr32(tmatmul,
+			     tmatmul_inst_off(0, TMATMUL_INST_RST_TRIGGER), 1);
+		msleep(50);
+		rc = readl_poll_timeout(tmatmul->csr +
+				tmatmul_inst_off(0, TMATMUL_INST_DBG_INSTR_CNT),
+				instr_count, !instr_count, 10, 100000);
+
+		reset_status = tmatmul_rd32(tmatmul,
+				tmatmul_inst_off(0, TMATMUL_INST_RST_STATUS));
+		exec_status = tmatmul_rd32(tmatmul,
+				tmatmul_inst_off(0, TMATMUL_INST_EXEC_STATUS));
+		dma_status = tmatmul_rd32(tmatmul,
+				tmatmul_inst_off(0, TMATMUL_INST_INSTR_START)) & 0xff;
+		stall_status = tmatmul_rd32(tmatmul,
+				tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS));
+		if (rc || reset_status || exec_status ||
+		    dma_status != TMATMUL_DMA_IDLE || stall_status) {
+			dev_warn(&tmatmul->pdev->dev,
+				 "tmatmul even-toggle rearm failed: rc=%d reset=%u exec=%u dma=%#x stall=%u instr=%u\n",
+				 rc, reset_status, exec_status, dma_status,
+				 stall_status, instr_count);
+		} else {
+			dev_dbg(&tmatmul->pdev->dev,
+				"tmatmul rearmed after even-toggle session\n");
+		}
+	}
+	mutex_unlock(&tmatmul->lock);
+	return 0;
+}
+
 static const struct file_operations cxl_type2_tmatmul_fops = {
 	.owner		= THIS_MODULE,
 	.unlocked_ioctl	= cxl_type2_tmatmul_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
+	.release	= cxl_type2_tmatmul_release,
 	.llseek		= noop_llseek,
 };
 
@@ -418,7 +1177,67 @@ static void cxl_type2_tmatmul_misc_deregister(void *data)
 	misc_deregister(data);
 }
 
-static int cxl_type2_tmatmul_init(struct pci_dev *pdev)
+static int cxl_type2_tmatmul_cold_rearm(struct cxl_type2_tmatmul_dev *tmatmul)
+{
+	u32 dma_status, exec_status, instr_count, reset_status, stall_status;
+
+	reset_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_RST_STATUS));
+	exec_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_EXEC_STATUS));
+	dma_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_INSTR_START)) & 0xff;
+	stall_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS));
+	instr_count = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_DBG_INSTR_CNT));
+
+	if (reset_status || exec_status || dma_status != TMATMUL_DMA_IDLE ||
+	    stall_status || instr_count) {
+		dev_err(&tmatmul->pdev->dev,
+			"refusing probe-time tmatmul reset from non-cold state: reset=%u exec=%u dma=%#x stall=%u instr=%u\n",
+			reset_status, exec_status, dma_status, stall_status,
+			instr_count);
+		return -EBUSY;
+	}
+
+	/*
+	 * A host reboot can reset the visible CSR state without guaranteeing that
+	 * every instance-local datapath has observed reset. Pulse the instance
+	 * reset once before exposing the miscdevice, then wait long enough to catch
+	 * a mismatched pulse-sync toggle replay. Registration is fail-closed unless
+	 * the complete instance remains cold.
+	 */
+	tmatmul_wr32(tmatmul,
+		     tmatmul_inst_off(0, TMATMUL_INST_RST_TRIGGER), 1);
+	msleep(100);
+
+	reset_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_RST_STATUS));
+	exec_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_EXEC_STATUS));
+	dma_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_INSTR_START)) & 0xff;
+	stall_status = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_STALL_STATUS));
+	instr_count = tmatmul_rd32(tmatmul,
+			tmatmul_inst_off(0, TMATMUL_INST_DBG_INSTR_CNT));
+	if (reset_status || exec_status || dma_status != TMATMUL_DMA_IDLE ||
+	    stall_status || instr_count) {
+		dev_err(&tmatmul->pdev->dev,
+			"probe-time tmatmul reset did not remain cold: reset=%u exec=%u dma=%#x stall=%u instr=%u\n",
+			reset_status, exec_status, dma_status, stall_status,
+			instr_count);
+		return -EIO;
+	}
+
+	dev_info(&tmatmul->pdev->dev,
+		 "tmatmul instance cold-rearmed before userspace exposure\n");
+	return 0;
+}
+
+static int cxl_type2_tmatmul_init_from(struct pci_dev *owner,
+				       struct pci_dev *csr_pdev)
 {
 	struct cxl_type2_tmatmul_dev *tmatmul;
 	resource_size_t bar0_start, bar0_len;
@@ -426,61 +1245,117 @@ static int cxl_type2_tmatmul_init(struct pci_dev *pdev)
 	u32 dev_id;
 	int rc;
 
-	bar0_start = pci_resource_start(pdev, 0);
-	bar0_len = pci_resource_len(pdev, 0);
+	bar0_start = pci_resource_start(csr_pdev, 0);
+	bar0_len = pci_resource_len(csr_pdev, 0);
 	if (!bar0_start || bar0_len < TMATMUL_CSR_BASE + TMATMUL_CSR_SIZE) {
-		dev_dbg(&pdev->dev, "BAR0 too small for tmatmul CSR window\n");
-		return 0;
+		dev_dbg(&owner->dev, "%s BAR0 too small for tmatmul CSR window\n",
+			 pci_name(csr_pdev));
+		return -ENODEV;
 	}
 
-	tmatmul = devm_kzalloc(&pdev->dev, sizeof(*tmatmul), GFP_KERNEL);
+	tmatmul = devm_kzalloc(&owner->dev, sizeof(*tmatmul), GFP_KERNEL);
 	if (!tmatmul)
 		return -ENOMEM;
 
-	tmatmul->pdev = pdev;
-	tmatmul->csr = devm_ioremap(&pdev->dev, bar0_start + TMATMUL_CSR_BASE,
+	tmatmul->pdev = csr_pdev;
+	tmatmul->csr = devm_ioremap(&owner->dev,
+				    bar0_start + TMATMUL_CSR_BASE,
 				    TMATMUL_CSR_SIZE);
 	if (!tmatmul->csr)
 		return -ENOMEM;
 
 	dev_id = tmatmul_rd32(tmatmul, TMATMUL_REG_DEV_ID);
 	if (dev_id != TMATMUL_DEV_ID) {
-		dev_info(&pdev->dev,
-			 "tmatmul CSR not present at BAR0+0x%x (dev_id=0x%08x)\n",
-			 TMATMUL_CSR_BASE, dev_id);
-		return 0;
+		dev_dbg(&owner->dev,
+			 "%s has no tmatmul CSR at BAR0+0x%x (dev_id=0x%08x)\n",
+			 pci_name(csr_pdev), TMATMUL_CSR_BASE, dev_id);
+		return -ENODEV;
 	}
 
 	mutex_init(&tmatmul->lock);
 
-	name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "cxl_tmatmul%02x%02x%x",
-			      pdev->bus->number, PCI_SLOT(pdev->devfn),
-			      PCI_FUNC(pdev->devfn));
+	rc = cxl_type2_tmatmul_cold_rearm(tmatmul);
+	if (rc)
+		return rc;
+
+	name = devm_kasprintf(&owner->dev, GFP_KERNEL,
+			      "cxl_tmatmul%02x%02x%x", owner->bus->number,
+			      PCI_SLOT(owner->devfn), PCI_FUNC(owner->devfn));
 	if (!name)
 		return -ENOMEM;
 
 	tmatmul->miscdev.minor = MISC_DYNAMIC_MINOR;
 	tmatmul->miscdev.name = name;
 	tmatmul->miscdev.fops = &cxl_type2_tmatmul_fops;
-	tmatmul->miscdev.parent = &pdev->dev;
+	tmatmul->miscdev.parent = &owner->dev;
 
 	rc = misc_register(&tmatmul->miscdev);
 	if (rc) {
-		dev_warn(&pdev->dev, "failed to register tmatmul miscdev: %d\n",
+		dev_warn(&owner->dev, "failed to register tmatmul miscdev: %d\n",
 			 rc);
-		return 0;
+		return rc;
 	}
 
-	rc = devm_add_action_or_reset(&pdev->dev,
+	rc = devm_add_action_or_reset(&owner->dev,
 				      cxl_type2_tmatmul_misc_deregister,
 				      &tmatmul->miscdev);
 	if (rc)
 		return rc;
 
-	dev_info(&pdev->dev,
-		 "tmatmul ready: /dev/%s CSR=BAR0+0x%x\n",
-		 name, TMATMUL_CSR_BASE);
+	dev_info(&owner->dev,
+		 "tmatmul ready: /dev/%s CSR=%s BAR0+0x%x\n",
+		 name, pci_name(csr_pdev), TMATMUL_CSR_BASE);
 	return 0;
+}
+
+static u32 cxl_type2_tmatmul_read_id(struct pci_dev *pdev)
+{
+	resource_size_t bar0_start = pci_resource_start(pdev, 0);
+	resource_size_t bar0_len = pci_resource_len(pdev, 0);
+	void __iomem *csr;
+	u32 dev_id = 0;
+
+	if (!bar0_start || bar0_len < TMATMUL_CSR_BASE + sizeof(dev_id))
+		return 0;
+
+	csr = ioremap(bar0_start + TMATMUL_CSR_BASE, sizeof(dev_id));
+	if (!csr)
+		return 0;
+	dev_id = readl(csr);
+	iounmap(csr);
+	return dev_id;
+}
+
+static int cxl_type2_tmatmul_init(struct pci_dev *owner)
+{
+	struct pci_dev *sibling = NULL;
+	struct pci_dev *provider = NULL;
+	enum tmatmul_csr_source source;
+	u32 current_id, sibling_id = 0;
+	int rc;
+
+	current_id = cxl_type2_tmatmul_read_id(owner);
+	if (PCI_FUNC(owner->devfn) == 0) {
+		sibling = pci_get_slot(owner->bus,
+				       PCI_DEVFN(PCI_SLOT(owner->devfn), 1));
+		if (sibling)
+			sibling_id = cxl_type2_tmatmul_read_id(sibling);
+	}
+
+	source = tmatmul_csr_source_for_pair(current_id, sibling_id);
+	if (source == TMATMUL_CSR_CURRENT)
+		provider = owner;
+	else if (source == TMATMUL_CSR_SIBLING)
+		provider = sibling;
+	else
+		dev_info(&owner->dev,
+			 "tmatmul CSR not present on PF0 or sibling PF1\n");
+
+	rc = provider ? cxl_type2_tmatmul_init_from(owner, provider) : 0;
+	if (sibling)
+		pci_dev_put(sibling);
+
+	return rc;
 }
 
 /**
@@ -501,6 +1376,108 @@ static int cxl_type2_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
 		return rc;
 
 	return cxl_setup_regs(map);
+}
+
+static int capcxl_read_identity(struct pci_dev *pf0, u64 *magic, u64 *caps)
+{
+	void __iomem *identity;
+
+	if (pci_resource_len(pf0, 0) < CAPCXL_ID_OFFSET + CAPCXL_ID_MAP_SIZE)
+		return -ENODEV;
+
+	identity = pci_iomap_range(pf0, 0, CAPCXL_ID_OFFSET,
+				  CAPCXL_ID_MAP_SIZE);
+	if (!identity)
+		return -ENOMEM;
+
+	*magic = readq(identity);
+	*caps = readq(identity + sizeof(*magic));
+	pci_iounmap(pf0, identity);
+	return 0;
+}
+
+static void capcxl_fill_pci_identity(struct pci_dev *pdev,
+				     struct capcxl_pci_identity *identity)
+{
+	*identity = (struct capcxl_pci_identity) {
+		.vendor = pdev->vendor,
+		.device = pdev->device,
+		.function = PCI_FUNC(pdev->devfn),
+		.class_code = pdev->class,
+		.revision = pdev->revision,
+	};
+}
+
+static enum capcxl_role capcxl_detect_role(struct pci_dev *pdev,
+					   struct pci_dev **pf0_out,
+					   struct pci_dev **pf1_out)
+{
+	struct capcxl_pci_identity pf0_identity, pf1_identity;
+	struct pci_dev *pf0, *pf1;
+	enum capcxl_role role;
+	u64 magic, caps;
+	int rc;
+
+	*pf0_out = NULL;
+	*pf1_out = NULL;
+	if (pdev->vendor != CAPCXL_VENDOR_ID ||
+	    pdev->device != CAPCXL_DEVICE_ID)
+		return CAPCXL_ROLE_NONE;
+
+	pf0 = pci_get_slot(pdev->bus,
+			   PCI_DEVFN(PCI_SLOT(pdev->devfn), 0));
+	pf1 = pci_get_slot(pdev->bus,
+			   PCI_DEVFN(PCI_SLOT(pdev->devfn), 1));
+	if (!pf0 || !pf1)
+		goto not_capcxl;
+
+	/* Balance this temporary enable even when PF0 is already enabled. */
+	rc = pci_enable_device_mem(pf0);
+	if (rc)
+		goto not_capcxl;
+	rc = capcxl_read_identity(pf0, &magic, &caps);
+	pci_disable_device(pf0);
+	if (rc)
+		goto not_capcxl;
+
+	capcxl_fill_pci_identity(pf0, &pf0_identity);
+	capcxl_fill_pci_identity(pf1, &pf1_identity);
+	role = capcxl_role_for_pair(magic, caps, PCI_FUNC(pdev->devfn),
+				    &pf0_identity, &pf1_identity);
+	if (role == CAPCXL_ROLE_NONE)
+		goto not_capcxl;
+
+	*pf0_out = pf0;
+	*pf1_out = pf1;
+	return role;
+
+not_capcxl:
+	if (pf0)
+		pci_dev_put(pf0);
+	if (pf1)
+		pci_dev_put(pf1);
+	return CAPCXL_ROLE_NONE;
+}
+
+static int capcxl_require_rch(struct pci_dev *pdev)
+{
+	struct cxl_dport *dport = NULL;
+	struct cxl_port *port;
+	bool rch;
+
+	port = cxl_pci_find_port(pdev, &dport);
+	if (!port)
+		return -EPROBE_DEFER;
+
+	rch = dport && dport->rch;
+	put_device(&port->dev);
+	if (!rch) {
+		dev_err(&pdev->dev,
+			"CapCXL requires the RCH root topology; load cxl_acpi with rch_parent_uid=3\n");
+		return -ENODEV;
+	}
+
+	return 0;
 }
 
 /*
@@ -540,18 +1517,10 @@ static void cxl_type2_enable_pf1(struct pci_dev *pf0)
 	pci_dev_put(pf1);
 }
 
-/*
- * Force-commit Decoder 0 of the device's HDM block with the given HPA range.
- * Sets the HOSTONLY bit so the CXL core classifies the endpoint decoder as
- * CXL_DECODER_HOSTONLYMEM — matching the platform's CFMWS root decoder type.
- * Without HOSTONLY the endpoint decoder is treated as DEVMEM (2) and the
- * cxl_region_attach check rejects it against the HOSTONLYMEM (3) region.
- *
- * Must run BEFORE devm_cxl_add_memdev so the endpoint port probe sees the
- * corrected ctrl state on its first read of the decoder.
- */
-static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
-				      u64 size)
+/* Force-commit Decoder 0 before memdev registration triggers port probing. */
+static int cxl_type2_force_commit_hdm(struct pci_dev *reg_pdev,
+				      struct device *owner, u64 base_pa,
+				      u64 size, bool hostonly)
 {
 	struct cxl_register_map comp_map = {};
 	void __iomem *comp_base, *cap_base, *hdm_base = NULL;
@@ -559,11 +1528,11 @@ static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	u32 cap_hdr, global_ctrl, ctrl, lo, hi;
 	int array_size, i, rc;
 
-	rc = cxl_find_regblock(pdev, CXL_REGLOC_RBI_COMPONENT, &comp_map);
+	rc = cxl_find_regblock(reg_pdev, CXL_REGLOC_RBI_COMPONENT, &comp_map);
 	if (rc || comp_map.resource == CXL_RESOURCE_NONE)
-		return 0;
+		return rc ?: -ENODEV;
 
-	comp_base = devm_ioremap(&pdev->dev, comp_map.resource,
+	comp_base = devm_ioremap(owner, comp_map.resource,
 				 comp_map.max_size);
 	if (IS_ERR_OR_NULL(comp_base))
 		return -ENOMEM;
@@ -583,9 +1552,9 @@ static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 		}
 	}
 	if (!hdm_base) {
-		dev_warn(&pdev->dev,
+		dev_warn(owner,
 			 "HDM Decoder capability not found in component regs\n");
-		return 0;
+		return -ENODEV;
 	}
 
 	/* Enable HDM decoding globally (RMW to preserve other bits). */
@@ -614,7 +1583,8 @@ static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	writel(upper_32_bits(size),
 	       hdm_base + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0));
 
-	writel(CXL_HDM_DECODER0_CTRL_COMMIT,
+	writel((hostonly ? CXL_HDM_DECODER0_CTRL_HOSTONLY : 0) |
+	       CXL_HDM_DECODER0_CTRL_COMMIT,
 	       hdm_base + CXL_HDM_DECODER0_CTRL_OFFSET(0));
 	msleep(100);
 
@@ -627,14 +1597,15 @@ static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	hi = readl(hdm_base + CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0));
 	rb_size = ((u64)hi << 32) | lo;
 
-	dev_info(&pdev->dev,
+	dev_info(owner,
 		 "HDM Decoder 0 force-commit readback: global_ctrl=0x%x ctrl=0x%x base=0x%llx size=0x%llx\n",
 		 global_ctrl, ctrl, rb_base, rb_size);
 
 	if (!(global_ctrl & CXL_HDM_DECODER_ENABLE) ||
 	    !(ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED) ||
+	    (!!(ctrl & CXL_HDM_DECODER0_CTRL_HOSTONLY) != hostonly) ||
 	    rb_base != base_pa || rb_size != size) {
-		dev_err(&pdev->dev,
+		dev_err(owner,
 			"HDM Decoder 0 did not latch requested range base=0x%llx size=0x%llx; refusing unsafe memdev registration\n",
 			base_pa, size);
 		return -EIO;
@@ -643,8 +1614,124 @@ static int cxl_type2_force_commit_hdm(struct pci_dev *pdev, u64 base_pa,
 	return 0;
 }
 
+static int capcxl_probe_type2(struct pci_dev *pdev)
+{
+	struct cxl_dev_state *cxlds;
+	struct cxl_cachedev *cxlcd;
+	int rc;
+
+	rc = pcim_enable_device(pdev);
+	if (rc)
+		return rc;
+	pci_set_master(pdev);
+
+	rc = capcxl_require_rch(pdev);
+	if (rc)
+		return rc;
+
+	cxlds = devm_kzalloc(&pdev->dev, sizeof(*cxlds), GFP_KERNEL);
+	if (!cxlds)
+		return -ENOMEM;
+
+	cxlds->dev = &pdev->dev;
+	cxlds->serial = pci_get_dsn(pdev);
+	cxlds->cxl_dvsec = pci_find_dvsec_capability(
+		pdev, PCI_VENDOR_ID_CXL, CXL_DVSEC_PCIE_DEVICE);
+	cxlds->type = CXL_DEVTYPE_DEVMEM;
+	cxlds->rcd = true;
+	cxlds->media_ready = true;
+	cxlds->reg_map.host = &pdev->dev;
+	cxlds->reg_map.resource = CXL_RESOURCE_NONE;
+	cxlds->cstate.size = 128 * SZ_1M;
+	cxlds->cstate.unit = 64;
+	cxlds->cstate.snoop_id = CXL_SNOOP_ID_NO_ID;
+	cxlds->cstate.cache_id = CXL_CACHE_ID_NO_ID;
+	pci_set_drvdata(pdev, cxlds);
+
+	cxlcd = devm_cxl_add_cachedev(&pdev->dev, cxlds);
+	if (IS_ERR(cxlcd))
+		return dev_err_probe(&pdev->dev, PTR_ERR(cxlcd),
+				     "failed to register CapCXL Type-2 cachedev\n");
+
+	dev_info(&pdev->dev,
+		 "CapCXL identity verified: PF0 initialized as Type-2 cachedev cache%d\n",
+		 cxlcd->id);
+	return 0;
+}
+
+static int capcxl_probe_type3(struct pci_dev *pdev, struct pci_dev *pf0)
+{
+	struct cxl_dpa_info dpa_info = {};
+	struct cxl_memdev_state *mds;
+	struct cxl_dev_state *cxlds;
+	struct cxl_memdev *cxlmd;
+	int rc;
+
+	rc = pcim_enable_device(pdev);
+	if (rc)
+		return rc;
+	pci_set_master(pdev);
+
+	rc = capcxl_require_rch(pdev);
+	if (rc)
+		return rc;
+
+	mds = cxl_memdev_state_create(&pdev->dev);
+	if (IS_ERR(mds))
+		return PTR_ERR(mds);
+	cxlds = &mds->cxlds;
+	cxlds->serial = pci_get_dsn(pdev);
+	cxlds->cxl_dvsec = pci_find_dvsec_capability(
+		pdev, PCI_VENDOR_ID_CXL, CXL_DVSEC_PCIE_DEVICE);
+	cxlds->type = CXL_DEVTYPE_CLASSMEM;
+	cxlds->rcd = true;
+	cxlds->media_ready = true;
+
+	rc = cxl_type2_setup_regs(pf0, CXL_REGLOC_RBI_COMPONENT,
+				  &cxlds->reg_map);
+	if (rc)
+		return dev_err_probe(&pdev->dev, rc,
+				     "PF0 shared component registers unavailable\n");
+	if (!cxlds->reg_map.component_map.hdm_decoder.valid)
+		return dev_err_probe(&pdev->dev, -ENODEV,
+				     "PF0 shared component block has no HDM decoder\n");
+
+	/* The physical locator is PF0; all persistent mappings belong to PF1. */
+	cxlds->reg_map.host = &pdev->dev;
+	cxlds->skip_dvsec_range_decode = true;
+	cxlds->hostonly_hdm_decoder = true;
+	mds->total_bytes = CAPCXL_MEMORY_SIZE;
+	mds->volatile_only_bytes = CAPCXL_MEMORY_SIZE;
+	mds->active_volatile_bytes = CAPCXL_MEMORY_SIZE;
+
+	rc = cxl_mem_dpa_fetch(mds, &dpa_info);
+	if (rc)
+		return rc;
+	rc = cxl_dpa_setup(cxlds, &dpa_info);
+	if (rc)
+		return rc;
+
+	rc = cxl_type2_force_commit_hdm(pf0, &pdev->dev,
+					CAPCXL_HPA_BASE, CAPCXL_MEMORY_SIZE,
+					true);
+	if (rc)
+		return rc;
+
+	pci_set_drvdata(pdev, cxlds);
+	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);
+	if (IS_ERR(cxlmd))
+		return dev_err_probe(&pdev->dev, PTR_ERR(cxlmd),
+				     "failed to register CapCXL Type-3 memdev\n");
+
+	dev_info(&pdev->dev,
+		 "CapCXL identity verified: PF1 initialized as Type-3 memdev mem%d (4 GiB volatile, shared PF0 HDM)\n",
+		 cxlmd->id);
+	return 0;
+}
+
 static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	struct pci_dev *capcxl_pf0, *capcxl_pf1;
 	struct cxl_register_map map;
 	struct cxl_memdev_state *mds;
 	struct cxl_dev_state *cxlds;
@@ -652,11 +1739,25 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct cxl_memdev *cxlmd;
 	enum cxl_type2_match_role match = id ? id->driver_data :
 		CXL_TYPE2_MATCH_GENERIC;
+	enum capcxl_role capcxl_role;
 	int rc;
+	u64 mapped_base, mapped_capacity;
 	u16 dvsec;
 
 	dev_info(&pdev->dev, "CXL Type 2 Accelerator driver probing function %d\n",
 		 PCI_FUNC(pdev->devfn));
+
+	capcxl_role = capcxl_detect_role(pdev, &capcxl_pf0, &capcxl_pf1);
+	if (capcxl_role != CAPCXL_ROLE_NONE) {
+		if (capcxl_role == CAPCXL_ROLE_TYPE2)
+			rc = capcxl_probe_type2(pdev);
+		else
+			rc = capcxl_probe_type3(pdev, capcxl_pf0);
+
+		pci_dev_put(capcxl_pf0);
+		pci_dev_put(capcxl_pf1);
+		return rc;
+	}
 
 	/*
 	 * IA-780I PF1 advertises the CXL memory-device class, but the FPGA
@@ -674,6 +1775,17 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 		dev_info(&pdev->dev,
 			 "IA-780I CXL memory-class PF bound; PF0 owns CXL DVSEC/register-locator handling\n");
+		return 0;
+	}
+
+	if (match == CXL_TYPE2_MATCH_IA780I_ACCEL &&
+	    PCI_FUNC(pdev->devfn) == 1) {
+		rc = pcim_enable_device(pdev);
+		if (rc)
+			return rc;
+		pci_set_master(pdev);
+		dev_info(&pdev->dev,
+			 "IA-780I tmatmul companion PF bound; PF0 owns CXL/DAX and the misc device\n");
 		return 0;
 	}
 
@@ -697,7 +1809,8 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	cxlds->cxl_dvsec = pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
 						      CXL_DVSEC_PCIE_DEVICE);
 	cxlds->type = CXL_DEVTYPE_CLASSMEM;
-	cxlds->media_ready = true;
+	cxlds->media_ready = false;
+	cxlds->dvsec_hdm_devmem = use_dvsec_hdm;
 
 	/*
 	 * Try to discover component registers with HDM decoder capability.
@@ -921,10 +2034,21 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return 0;
 	}
 
-	/* Set device memory size (4GB, matches QEMU mem-size parameter) */
-	mds->total_bytes = 4ULL * SZ_1G;
-	mds->volatile_only_bytes = 4ULL * SZ_1G;
-	mds->active_volatile_bytes = 4ULL * SZ_1G;
+	rc = cxl_type2_identify_capacity(mds, &mapped_base,
+					 &mapped_capacity);
+	if (rc) {
+		dev_err(&pdev->dev,
+			"CXL memdev/HDM/DAX registration skipped: endpoint Identify did not report usable capacity (%d)\n",
+			rc);
+		rc = cxl_type2_tmatmul_init(pdev);
+		if (rc)
+			dev_warn(&pdev->dev,
+				 "tmatmul init failed: %d\n", rc);
+
+		dev_info(&pdev->dev,
+			 "CXL Type 2 Accelerator driver probed in CSR-only mode\n");
+		return 0;
+	}
 
 	/* Set up DPA partitions (must happen before devm_cxl_add_memdev) */
 	{
@@ -940,35 +2064,49 @@ static int cxl_type2_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		}
 	}
 
-	/*
-	 * Force-commit HDM Decoder 0 BEFORE registering the memdev so the
-	 * endpoint port probe (triggered inside devm_cxl_add_memdev) reads
-	 * a non-zero HPA range from the device.
-	 *
-	 * Use the IA-780I platform's CFMWS Type-2 window for this device's
-	 * host bridge (dport50): HPA 0x180000000000.  This must match the
-	 * BASE reset value in the FPGA bitstream's cafu_csr0_cfg_pkg.sv
-	 * (HDM_DEC_BASEHIGH_RESET=0x1800).  With the addresses aligned,
-	 * cxl_find_root_decoder() picks decoder0.12 (cap_type2=1,
-	 * target_list=50), and the standard cxl_region_attach() flow can
-	 * route this endpoint into the platform-managed Type-2 region.
-	 */
-	rc = cxl_type2_force_commit_hdm(pdev, 0x180000000000ULL,
-					mds->total_bytes);
-	if (rc && !allow_uncommitted_hdm) {
-		dev_err(&pdev->dev,
-			"CXL memdev/HDM/DAX registration skipped after HDM commit failure (set allow_uncommitted_hdm=1 only for unsafe debug; do not online memory)\n");
-		rc = cxl_type2_tmatmul_init(pdev);
-		if (rc)
-			dev_warn(&pdev->dev, "tmatmul init failed: %d\n", rc);
+	if (use_dvsec_hdm) {
+		rc = type2_coalesce_soft_reserved(&pdev->dev, mapped_base,
+						  mapped_capacity);
+		if (rc) {
+			dev_err(&pdev->dev,
+				"CXL memdev/HDM/DAX registration skipped: native DVSEC resource ownership is unsafe (%d)\n",
+				rc);
+			rc = cxl_type2_tmatmul_init(pdev);
+			if (rc)
+				dev_warn(&pdev->dev,
+					 "tmatmul init failed: %d\n", rc);
 
+			dev_info(&pdev->dev,
+				 "CXL Type 2 Accelerator driver probed in CSR-only mode\n");
+			return 0;
+		}
 		dev_info(&pdev->dev,
-			 "CXL Type 2 Accelerator driver probed in CSR-only mode\n");
-		return 0;
+			 "using active DVSEC range %#llx-%#llx for software Type-2 endpoint decoder\n",
+			 mapped_base, mapped_base + mapped_capacity - 1);
+	} else {
+		/*
+		 * Keep the hardware-commit path for platforms where the component
+		 * decoder is writable and matches the host route.
+		 */
+		rc = cxl_type2_force_commit_hdm(pdev, &pdev->dev,
+						type2_hpa_base,
+						mapped_capacity, false);
+		if (rc && !allow_uncommitted_hdm) {
+			dev_err(&pdev->dev,
+				"CXL memdev/HDM/DAX registration skipped after HDM commit failure (set allow_uncommitted_hdm=1 only for unsafe debug; do not online memory)\n");
+			rc = cxl_type2_tmatmul_init(pdev);
+			if (rc)
+				dev_warn(&pdev->dev,
+					 "tmatmul init failed: %d\n", rc);
+
+			dev_info(&pdev->dev,
+				 "CXL Type 2 Accelerator driver probed in CSR-only mode\n");
+			return 0;
+		}
+		if (rc)
+			dev_warn(&pdev->dev,
+				 "allow_uncommitted_hdm=1: registering memdev despite failed HDM commit; do not online memory\n");
 	}
-	if (rc)
-		dev_warn(&pdev->dev,
-			 "allow_uncommitted_hdm=1: registering memdev despite failed HDM commit; do not online memory\n");
 
 	/* Register as a CXL memory device for decoder/region/DAX flow */
 	cxlmd = devm_cxl_add_memdev(&pdev->dev, cxlds);
